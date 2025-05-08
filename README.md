@@ -1,6 +1,7 @@
 # langchain-meta
 
-This package contains the LangChain integration with ChatMetaLlama
+This package contains a LangChain integration with ChatMetaLlama.
+Wraps the official [Llama API Client/SDK from Meta](https://github.com/meta-llama/llama-api-python)
 
 ## Installation
 
