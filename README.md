@@ -10,22 +10,27 @@ pip install -U langchain-meta
 
 And you should configure credentials by setting the following environment variables:
 
-* TODO: fill this out
+```bash
+export META_API_KEY="your-api-key"
+export META_NATIVE_API_BASE_URL="https://api.llama.com/v1"
+export META_MODEL_NAME="Llama-4-Maverick-17B-128E-Instruct-FP8" 
+# Optional, see list: https://llama.developer.meta.com/docs/api/models/
+```
 
 ## Chat Models
 
-`ChatChatMetaLlama` class exposes chat models from ChatMetaLlama.
+`ChatMetaLlama` class exposes chat models from Meta Llama API.
 
 ```python
-from langchain_meta import ChatChatMetaLlama
+from langchain_meta import ChatMetaLlama
 
-llm = ChatChatMetaLlama()
-llm.invoke("Sing a ballad of LangChain.")
+llm = ChatMetaLlama()
+llm.invoke("Who directed the movie The Social Network?")
 ```
 
 ## Embeddings
 
-`ChatMetaLlamaEmbeddings` class exposes embeddings from ChatMetaLlama.
+`ChatMetaLlamaEmbeddings` class exposes embeddings from Meta Llama API.
 
 ```python
 from langchain_meta import ChatMetaLlamaEmbeddings
@@ -35,11 +40,11 @@ embeddings.embed_query("What is the meaning of life?")
 ```
 
 ## LLMs
-`ChatMetaLlamaLLM` class exposes LLMs from ChatMetaLlama.
+`ChatMetaLlama` class exposes LLMs from Meta Llama API.
 
 ```python
-from langchain_meta import ChatMetaLlamaLLM
+from langchain_meta import ChatMetaLlama
 
-llm = ChatMetaLlamaLLM()
+llm = ChatMetaLlama()
 llm.invoke("The meaning of life is")
 ```
