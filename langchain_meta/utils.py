@@ -96,7 +96,7 @@ def extract_json_response(content):
     content = content.strip()
     try:
         return json.loads(content)
-    except:
+    except json.JSONDecodeError:
         pass
         
     # Try to extract JSON from code blocks
