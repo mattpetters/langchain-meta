@@ -1,4 +1,12 @@
-"""LangChain integration package for Meta Llama API."""
-from langchain_meta.chat_models import ChatMetaLlama
+"""LangChain <> Meta Llama API integration package."""
 
-__all__ = ["ChatMetaLlama"]
+__version__ = "0.3.2"
+
+from langchain_meta.chat_models import ChatMetaLlama
+from langchain_meta.utils import meta_agent_factory, extract_json_response
+
+__all__ = [
+    "ChatMetaLlama",
+    "meta_agent_factory",
+    "extract_json_response",
+]

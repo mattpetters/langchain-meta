@@ -1,12 +1,12 @@
 # langchain-meta
 
-Native integration between Meta's [Llama API](https://www.llama.com/products/llama-api/) 🦙 and the [LangChain/LangGraph ecosystem](https://www.langchain.com/), ⛓ providing fast hosted access to Meta's powerful Llama 4 models to power your Langgraph agents. 
+Native integration between the [Meta Llama API](https://www.llama.com/products/llama-api/) 🦙 and the [LangChain/LangGraph ecosystem](https://www.langchain.com/), ⛓ providing fast hosted access to Meta's powerful Llama 4 models to power your Langgraph agents. 
 Fully implements [ChatModel interface](https://python.langchain.com/docs/concepts/chat_models/).
 
 ## Installation 
 
 ```bash
-pip install -U langchain-meta
+pip install langchain-meta
 ```
 
 Set up your credentials with environment variables:
@@ -18,9 +18,76 @@ export META_MODEL_NAME="Llama-4-Maverick-17B-128E-Instruct-FP8"
 # Optional, see list: https://llama.developer.meta.com/docs/api/models/
 ```
 
+## Usage
+
+### ChatMetaLlama
+
+```python
+from langchain_meta import ChatMetaLlama
+
+# Initialize with API key and base URL
+llm = ChatMetaLlama(
+    model="Llama-4-Maverick-17B-128E-Instruct-FP8",
+    api_key="your-meta-api-key",
+    base_url="https://api.llama.com/v1/"
+)
+
+# Basic invocation
+from langchain_core.messages import HumanMessage
+response = llm.invoke([HumanMessage(content="Hello Llama!")])
+print(response.content)
+```
+
+### Utility Functions
+
+#### meta_agent_factory
+
+A utility to create LangChain runnables with Meta-specific configurations. Handles structured output and ensures streaming is disabled when needed for Meta API compatibility.
+
+```python
+from langchain_meta import meta_agent_factory, ChatMetaLlama
+from langchain_core.tools import Tool
+from pydantic import BaseModel
+
+# Create LLM
+llm = ChatMetaLlama(api_key="your-meta-api-key")
+
+# Example with tools
+tools = [Tool.from_function(func=lambda x: x, name="example", description="Example tool")]
+agent = meta_agent_factory(
+    llm=llm,
+    tools=tools,
+    system_prompt_text="You are a helpful assistant that uses tools.",
+    disable_streaming=True
+)
+
+# Example with structured output
+class ResponseSchema(BaseModel):
+    answer: str
+    confidence: float
+
+structured_agent = meta_agent_factory(
+    llm=llm,
+    output_schema=ResponseSchema,
+    system_prompt_text="Return structured answers with confidence scores."
+)
+```
+
+#### extract_json_response
+
+A robust utility to extract JSON from various response formats, handling direct JSON objects, code blocks with backticks, or JSON-like patterns in text.
+
+```python
+from langchain_meta import extract_json_response
+
+# Parse various response formats
+result = llm.invoke("Return a JSON with name and age")
+parsed_json = extract_json_response(result.content)
+```
+
 ## Key Features
 
-- **Direct Native API Access**: Connect to Meta's Llama models through their official API for full feature compatibility
+- **Direct Native API Access**: Connect to Meta Llama models through their official API for full feature compatibility
 - **Seamless Tool Calling**: Intelligent conversion between LangChain tool formats and Llama API requirements
 - **Complete Message History Support**: Proper conversion of all LangChain message types
 - **Multi-Agent System Compatibility**: Drop-in replacement for ChatOpenAI in LangGraph workflows
