@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "langchain-meta"
-version = "0.1.1"
+version = "0.3.2"
 description = "An integration wrapper package connecting Meta's Llama API client and LangGraph. Implements ChatModel interface from LangChain."
 authors = []
 readme = "README.md"
@@ -19,10 +19,13 @@ disallow_untyped_defs = true
 "Release Notes" = "https://github.com/mattpetters/langchain-meta/releases?q=tag%3A%22meta%3D%3D0%22&expanded=true"
 
 [tool.poetry.dependencies]
-python = ">=3.9,<4.0"
-langchain-core = "^0.3.15"
+python = ">=3.9,<3.14"
+pydantic = ">=1.10,<3.0"
 llama-api-client = "^0.1.0"
+langchain-core = ">=0.1.33,<0.4.0"
 twine = "^6.1.0"
+typing-extensions = ">=4.8.0"
+regex = ">=2023.0.0"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "T201"]
