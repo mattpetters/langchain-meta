@@ -13,7 +13,7 @@ from langchain_meta import ChatMetaLlama
 
 # API Configuration with real credentials
 API_KEY = os.environ.get("META_API_KEY","TEST_KEY")
-BASE_URL = os.environ.get("META_NATIVE_API_BASE_URL", "https://api.llama.com/v1/")
+BASE_URL = os.environ.get("META_API_BASE_URL", "https://api.llama.com/v1/")
 MODEL_NAME = os.environ.get("META_MODEL_NAME", "Llama-4-Maverick-17B-128E-Instruct-FP8")
 
 print(f"API Key (first 10 chars): {API_KEY[:10]}...")

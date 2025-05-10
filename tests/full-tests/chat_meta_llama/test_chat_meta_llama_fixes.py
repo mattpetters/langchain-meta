@@ -50,7 +50,7 @@ def test_root_validator_with_env_vars_fixed():
     # Set environment variables
     with patch.dict(os.environ, {
         "META_API_KEY": "env_key",
-        "META_NATIVE_API_BASE_URL": "https://env.api"
+        "META_API_BASE_URL": "https://env.api"
     }, clear=True):
         # Skip validating client creation since it's hard to patch properly
         # Just verify that the model can be instantiated without errors

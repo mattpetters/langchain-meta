@@ -11,7 +11,7 @@ MODEL_NAME = os.environ.get("META_MODEL_NAME", "Llama-4-Maverick-17B-128E-Instru
 INTEGRATION_ENABLED = os.environ.get("INTEGRATION_ENABLED", "false").lower() == "true"
 
 # Base URL for the native Llama API client
-NATIVE_BASE_URL = os.environ.get("META_NATIVE_API_BASE_URL", "https://api.llama.com/v1/")
+NATIVE_BASE_URL = os.environ.get("META_API_BASE_URL", "https://api.llama.com/v1/")
 
 # Skip all tests in this file if the API key is not set OR if integration tests are not enabled
 pytestmark_integration = pytest.mark.skipif(
@@ -277,7 +277,7 @@ def test_llama_client_tool_choice_required_fails(llama_client_fixture: LlamaAPIC
 #     pass
 
 # Potentially at the top with other env var getters:
-# NATIVE_BASE_URL = os.environ.get("META_NATIVE_API_BASE_URL", "https://api.llama.com/v1/") # Moved to top
+# NATIVE_BASE_URL = os.environ.get("META_API_BASE_URL", "https://api.llama.com/v1/") # Moved to top
 
 # @pytest.fixture(scope="module") # Moved this fixture definition higher up in the file
 # def llama_client_fixture():
