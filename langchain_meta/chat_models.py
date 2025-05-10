@@ -745,9 +745,15 @@ class ChatMetaLlama(BaseChatModel):
         logger.debug(f"Meta API call params: {api_params}")
 
         try:
-            response_obj: CreateChatCompletionResponse = (
-                await active_client.chat.completions.create(**api_params)
-            )
+            # Call the API but handle both awaitable and non-awaitable responses
+            call_result = active_client.chat.completions.create(**api_params)
+            # Check if the result is awaitable or already a response
+            if hasattr(call_result, "__await__") and callable(getattr(call_result, "__await__")):
+                # It's an awaitable, so await it
+                response_obj = await call_result
+            else:
+                # It's already the response object
+                response_obj = call_result
             logger.debug(f"Meta API response: {response_obj}")
         except APIError as e:
             logger.error(f"Meta API error: {e}")
