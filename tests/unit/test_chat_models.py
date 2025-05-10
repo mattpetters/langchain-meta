@@ -363,7 +363,8 @@ async def test_async_tool_choice_parameter_filtering():
     assert processed["temperature"] == 0.5
     
     # Get the actual method logic from the class implementation
-    filter_code = "\n".join([line for line in ChatMetaLlama._agenerate.__code__.co_consts if isinstance(line, str) and "tool_choice" in line])
+    # Inspect _generate as tool_choice logic is now there
+    filter_code = "\n".join([line for line in ChatMetaLlama._generate.__code__.co_consts if isinstance(line, str) and "tool_choice" in line])
     assert "tool_choice" in filter_code, "The class should mention tool_choice in its code"
     assert "not supported" in filter_code.lower(), "The class should warn that tool_choice is not supported"
 
