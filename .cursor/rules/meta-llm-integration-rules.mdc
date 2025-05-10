@@ -1,7 +1,7 @@
 ---
-description: These rules should be automatically attached when working with the Meta LLM integration code or any LLM-related files
+description: 
 globs: 
-alwaysApply: false
+alwaysApply: true
 ---
 # Meta LLM Integration Rules
 

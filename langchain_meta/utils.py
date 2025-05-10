@@ -5,37 +5,50 @@ Meta-specific utility functions for better integration with LangChain and LangGr
 import json
 import re
 import logging
-from typing import Dict, Any, Optional, List, Type, cast
+from typing import Dict, Any, Optional, List, Type, Union
 
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.base import RunnableSequence, Runnable
 from langchain_core.tools import StructuredTool
 from langchain_core.language_models import BaseChatModel
 from langchain_core.runnables import RunnablePassthrough
+from pydantic import BaseModel
 
 # Set up logging
 logger = logging.getLogger(__name__)
 
 def meta_agent_factory(
     llm: BaseChatModel,
-    tools: List[StructuredTool] = None,
+    tools: Optional[List[StructuredTool]] = None,
     system_prompt_text: str = "",
-    output_schema = None,  # Optional structured output schema
+    output_schema: Optional[Union[Type[BaseModel], dict]] = None,
     disable_streaming: bool = False,
-    additional_tags: List[str] = None,
+    additional_tags: Optional[List[str]] = None,
 ) -> RunnableSequence:
-    """Create a Meta-specific agent with structured output support.
-    
+    """
+    Create a Meta-specific agent with structured output support.
+
     Args:
         llm: Base language model to use
         tools: Optional list of tools for the agent to use
         system_prompt_text: Optional system prompt to override the default
-        output_schema: Optional Pydantic schema for structured output
+        output_schema: Optional Pydantic schema or dict for structured output
         disable_streaming: Whether to disable streaming
         additional_tags: Optional list of additional tags
-        
+
     Returns:
         A runnable chain that can be used for structured output
+
+    Example:
+        >>> from langchain_core.language_models import BaseChatModel
+        >>> from langchain_core.tools import StructuredTool
+        >>> from pydantic import BaseModel
+        >>> class MySchema(BaseModel):
+        ...     foo: str
+        >>> llm = ... # some BaseChatModel
+        >>> tools = [StructuredTool(...)]
+        >>> agent = meta_agent_factory(llm, tools=tools, output_schema=MySchema)
+        >>> result = agent.invoke({"messages": [...]})
     """
     # Use structured output if schema is provided
     if output_schema is not None:
@@ -74,7 +87,7 @@ def meta_agent_factory(
     return prompt | bound_llm
 
 
-def extract_json_response(content):
+def extract_json_response(content: Any) -> Any:
     """
     Extract JSON from various response formats.
     

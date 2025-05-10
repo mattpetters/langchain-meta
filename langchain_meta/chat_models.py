@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import warnings
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, cast
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, cast, ClassVar
 from unittest.mock import MagicMock
 from datetime import datetime
 import re
@@ -27,6 +27,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic.v1 import Field, validator
 from pydantic.v1.fields import FieldInfo
 from pydantic.v1 import BaseModel as PydanticV1BaseModel
+from pydantic import model_validator, PrivateAttr
 
 from llama_api_client import APIError, LlamaAPIClient
 from llama_api_client.types import MessageParam  # Explicitly for input messages
@@ -163,173 +164,97 @@ def _lc_message_to_llama_message_param(message: BaseMessage) -> MessageParam:
 
 
 # Helper to convert LangChain Tool/Function definitions to Llama API's tool format
-def _lc_tool_to_llama_tool_param(lc_tool: Any) -> completion_create_params.Tool:
-    """Converts a LangChain tool to the Llama API tool parameter format."""
-    
-    # Log what we're trying to convert for debugging
-    tool_type = type(lc_tool).__name__
-    tool_module = getattr(type(lc_tool), "__module__", "unknown")
-    logger.debug(f"Converting tool to Llama format: {tool_type} from {tool_module}")
-    
-    if hasattr(lc_tool, "name"):
-        logger.debug(f"Tool name: {lc_tool.name}")
-    
-    # Case 1: Already in Llama API dict format
-    if isinstance(lc_tool, dict) and "function" in lc_tool and isinstance(lc_tool["function"], dict):
-        logger.debug("Tool is already in Llama API format")
-        return lc_tool # type: ignore
 
-    # Case 2: Tool is a Pydantic model class
+def _convert_dict_tool(lc_tool: Any) -> dict:
+    """Convert a dict tool already in Llama API format."""
+    if isinstance(lc_tool, dict) and "function" in lc_tool and isinstance(lc_tool["function"], dict):
+        return lc_tool
+    raise ValueError("Not a dict tool")
+
+def _convert_pydantic_class_tool(lc_tool: Any) -> dict:
+    """Convert a Pydantic model class tool."""
     if isinstance(lc_tool, type):
-        logger.debug("Tool is a Pydantic model class")
-        try:
-            # Try to get name from class
-            name = getattr(lc_tool, "__name__", "UnnamedTool")
-            # Try to get description from docstring
-            description = getattr(lc_tool, "__doc__", "") or ""
-            
-            # Try to get schema from schema() method or model_json_schema()
-            parameters = {}
-            if hasattr(lc_tool, "schema") and callable(getattr(lc_tool, "schema")):
-                parameters = lc_tool.schema()
-                logger.debug("Used schema() method to get parameters")
-            elif hasattr(lc_tool, "model_json_schema") and callable(getattr(lc_tool, "model_json_schema")):
-                parameters = lc_tool.model_json_schema()
-                logger.debug("Used model_json_schema() method to get parameters")
-            
-            # Ensure parameters is a valid schema
-            if not isinstance(parameters, dict):
-                logger.warning(f"Schema for {name} is not a dict: {type(parameters)}. Using empty schema.")
-                parameters = {"type": "object", "properties": {}}
-                
-            return {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": description,
-                    "parameters": parameters,
-                },
-            }
-        except Exception as e:
-            logger.warning(f"Error converting Pydantic model class to tool: {e}", exc_info=True)
-            # Continue to other cases
-    
-    # Case 3: Handle objects with name, description, and schema_
-    if hasattr(lc_tool, "name") and hasattr(lc_tool, "description") and hasattr(lc_tool, "schema_"):
-        logger.debug("Tool has name, description, and schema_ attributes")
-        
-        # Ensure name and description are strings
-        name = getattr(lc_tool, "name", "")
-        description = getattr(lc_tool, "description", "")
-        
-        if not isinstance(name, str):
-            logger.warning(f"Tool name is not a string: {type(name)}. Converting to string.")
-            name = str(name)
-            
-        if not isinstance(description, str):
-            logger.warning(f"Tool description is not a string: {type(description)}. Converting to string.")
-            description = str(description)
-            
-        schema_ = getattr(lc_tool, "schema_", None)
-        if not isinstance(schema_, dict):
-            logger.warning(f"Tool schema_ is not a dict: {type(schema_)}. Using empty schema.")
-            schema_ = {"type": "object", "properties": {}}
-        
-        # Use the schema_ directly
+        name = getattr(lc_tool, "__name__", "UnnamedTool")
+        description = getattr(lc_tool, "__doc__", "") or ""
+        parameters = {}
+        if hasattr(lc_tool, "schema") and callable(getattr(lc_tool, "schema")):
+            parameters = lc_tool.schema()
+            logger.debug(f"Used schema() method to get parameters for {name}")
+        elif hasattr(lc_tool, "model_json_schema") and callable(getattr(lc_tool, "model_json_schema")):
+            parameters = lc_tool.model_json_schema()
+            logger.debug(f"Used model_json_schema() method to get parameters for {name}")
+        if not isinstance(parameters, dict):
+            logger.warning(f"Schema for {name} is not a dict: {type(parameters)}. Using empty schema.")
+            parameters = {"type": "object", "properties": {}}
         return {
             "type": "function",
             "function": {
                 "name": name,
                 "description": description,
-                "parameters": schema_,
+                "parameters": parameters,
             },
         }
-    
-    # Case 4: Handle StructuredTool from LangChain
-    # This directly handles langchain_core.tools.structured.StructuredTool objects
+    raise ValueError("Not a Pydantic class tool")
+
+def _convert_structured_tool(lc_tool: Any) -> dict:
+    """Convert a StructuredTool or similar object."""
     if hasattr(lc_tool, "name") and hasattr(lc_tool, "description"):
-        logger.debug("Tool appears to be a StructuredTool or similar")
-        
-        # Extract name and description with safer error handling
         name = getattr(lc_tool, "name", "unnamed_tool")
         description = getattr(lc_tool, "description", "")
-        
-        # Ensure they're strings
         if not isinstance(name, str):
             logger.warning(f"Tool name is not a string: {type(name)}. Converting to string.")
             name = str(name)
-            
         if not isinstance(description, str):
             logger.warning(f"Tool description is not a string: {type(description)}. Converting to string.")
             description = str(description)
         
-        # Extract schema from args_schema
+        # Handle objects with name, description, and schema_ (Case 3 from original)
+        if hasattr(lc_tool, "schema_"):
+            schema_ = getattr(lc_tool, "schema_", None)
+            if isinstance(schema_, dict):
+                logger.debug(f"Using schema_ attribute for tool {name}")
+                return {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": schema_,
+                    },
+                }
+            else:
+                logger.warning(f"Tool {name} has schema_ attribute, but it's not a dict: {type(schema_)}. Proceeding to args_schema.")
+
         parameters_schema = {"type": "object", "properties": {}}
-        
-        # Check for args_schema
         if hasattr(lc_tool, "args_schema"):
             args_schema = lc_tool.args_schema
-            
-            # Skip validation if None
-            if args_schema is None:
-                logger.debug(f"Tool {name} has args_schema=None. Using empty schema.")
-            else:
+            if args_schema is not None:
                 try:
-                    # Handle different types of args_schema
                     if isinstance(args_schema, type) and hasattr(args_schema, "schema") and callable(getattr(args_schema, "schema")):
-                        # Pydantic v1 model class
                         parameters_schema = args_schema.schema()
-                        logger.debug(f"Extracted schema from Pydantic v1 model class {args_schema.__name__}")
-                    
+                        logger.debug(f"Extracted schema from Pydantic v1 model class {args_schema.__name__} for {name}")
                     elif hasattr(args_schema, "model_json_schema") and callable(getattr(args_schema, "model_json_schema")):
-                        # Pydantic v2 model
                         parameters_schema = args_schema.model_json_schema()
-                        logger.debug("Extracted schema using model_json_schema()")
-                    
+                        logger.debug(f"Extracted schema using model_json_schema() for {name}")
                     elif hasattr(args_schema, "schema") and callable(getattr(args_schema, "schema")):
-                        # Instance with schema() method
                         parameters_schema = args_schema.schema()
-                        logger.debug("Extracted schema using schema() method on instance")
-                    
+                        logger.debug(f"Extracted schema using schema() method on instance for {name}")
                     elif isinstance(args_schema, dict):
-                        # Direct dict schema
                         parameters_schema = args_schema
-                        logger.debug("Using direct dict schema")
-                    
-                    elif hasattr(args_schema, "schema_") and isinstance(args_schema.schema_, dict):
-                        # Object with schema_ attribute
-                        parameters_schema = args_schema.schema_
-                        logger.debug("Extracted schema from schema_ attribute")
-                    
-                    # Handle ModelMetaclass and similar constructs
+                        logger.debug(f"Using direct dict schema for {name}")
+                    # Removed schema_ check here as it's handled above
                     elif hasattr(args_schema, "__annotations__"):
-                        # Build a schema from annotations
-                        logger.debug("Building schema from __annotations__")
                         properties = {}
                         for field_name, field_type in args_schema.__annotations__.items():
-                            # Get the type name as a string
                             type_name = getattr(field_type, "__name__", str(field_type))
-                            
-                            # Convert Python type to JSON schema type
                             json_type = _get_json_type_for_annotation(type_name)
-                            
-                            # Add field to properties
-                            properties[field_name] = {
-                                "type": json_type,
-                                "description": f"The {field_name} parameter"
-                            }
-                        
-                        # Create the final schema
-                        parameters_schema = {
-                            "type": "object",
-                            "properties": properties,
-                            "required": list(args_schema.__annotations__.keys())
-                        }
+                            properties[field_name] = {"type": json_type, "description": f"The {field_name} parameter"}
+                        parameters_schema = {"type": "object", "properties": properties, "required": list(args_schema.__annotations__.keys())}
+                        logger.debug(f"Built schema from __annotations__ for {name}")
                 except Exception as e:
-                    logger.warning(f"Error extracting schema from {name}'s args_schema: {e}", exc_info=True)
-                    # Continue with the default empty schema
-        
-        # Return the final formatted tool with the best schema we could get
+                    logger.warning(f"Error extracting schema from {name}'s args_schema: {e}. Using empty schema.", exc_info=True)
+                    parameters_schema = {"type": "object", "properties": {}} # Ensure fallback on error
+            else:
+                logger.debug(f"Tool {name} has args_schema=None. Using empty schema.")
         return {
             "type": "function",
             "function": {
@@ -338,12 +263,33 @@ def _lc_tool_to_llama_tool_param(lc_tool: Any) -> completion_create_params.Tool:
                 "parameters": parameters_schema,
             },
         }
-    
-    # Case 5: Handle RouteSchema special case, useful for LangGraph supervisor patterns
+    raise ValueError("Not a StructuredTool or object with schema_")
+
+def _convert_parse_method_tool(lc_tool: Any) -> dict:
+    """Convert a tool object with a parse method."""
+    if hasattr(lc_tool, "parse") and callable(getattr(lc_tool, "parse")):
+        name = getattr(lc_tool, "name", None) or getattr(lc_tool, "__class__", None).__name__
+        description = getattr(lc_tool, "__doc__", "") or f"Tool that parses {name}"
+        parameters_schema = {"type": "object", "properties": {}}
+        if hasattr(lc_tool, "schema"):
+            if callable(getattr(lc_tool, "schema")):
+                parameters_schema = lc_tool.schema()
+            elif isinstance(lc_tool.schema, dict):
+                parameters_schema = lc_tool.schema
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": parameters_schema,
+            },
+        }
+    raise ValueError("Not a parse-method tool")
+
+def _convert_route_schema_tool(lc_tool: Any) -> dict:
+    """Convert a RouteSchema special case tool."""
     route_schema_names = ["RouteSchema", "route_schema"]
-    if (hasattr(lc_tool, "name") and getattr(lc_tool, "name") in route_schema_names):
-        # Provide a simplified hardcoded format for now
-        logger.debug(f"Using simplified schema for {getattr(lc_tool, 'name')}")
+    if hasattr(lc_tool, "name") and getattr(lc_tool, "name") in route_schema_names:
         return {
             "type": "function",
             "function": {
@@ -361,65 +307,39 @@ def _lc_tool_to_llama_tool_param(lc_tool: Any) -> completion_create_params.Tool:
                 }
             }
         }
-    
-    # Special case for tool objects that have a parse method (common in certain LangChain patterns)
-    if hasattr(lc_tool, "parse") and callable(getattr(lc_tool, "parse")):
-        logger.debug(f"Found object with parse method, attempting to extract schema")
-        try:
-            # Try to get a name
-            name = getattr(lc_tool, "name", None) or getattr(lc_tool, "__class__", None).__name__
-            # Try to get a description
-            description = getattr(lc_tool, "__doc__", "") or f"Tool that parses {name}"
-            
-            # Create a minimal schema
-            parameters_schema = {"type": "object", "properties": {}}
-            
-            # If it has a schema attribute, try to use that
-            if hasattr(lc_tool, "schema"):
-                if callable(getattr(lc_tool, "schema")):
-                    parameters_schema = lc_tool.schema()
-                    logger.debug(f"Extracted schema using schema() method")
-                elif isinstance(lc_tool.schema, dict):
-                    parameters_schema = lc_tool.schema
-                    logger.debug(f"Using schema dict attribute")
-            
-            return {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": description,
-                    "parameters": parameters_schema,
-                },
-            }
-        except Exception as e:
-            logger.warning(f"Error extracting schema from parse object: {e}", exc_info=True)
-    
-    # If we got to this point, we couldn't convert the tool
+    raise ValueError("Not a RouteSchema tool")
+
+def _create_minimal_tool(lc_tool: Any) -> dict:
+    """Fallback: create a minimal tool with empty schema."""
+    tool_type = type(lc_tool).__name__
+    name = str(getattr(lc_tool, "name", None) or tool_type)
+    description = str(getattr(lc_tool, "description", None) or "")
     tool_repr = str(lc_tool)[:100] + "..." if len(str(lc_tool)) > 100 else str(lc_tool)
-    logger.error(f"Could not convert tool to Llama API format: {tool_type} {tool_repr}")
-    
-    # Last resort fallback - try to convert to a minimal tool with an empty schema
-    try:
-        name = str(getattr(lc_tool, "name", None) or tool_type)
-        description = str(getattr(lc_tool, "description", None) or "")
-        
-        logger.warning(f"Creating fallback tool for {name} with empty schema")
-        return {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": {"type": "object", "properties": {}},
-            },
-        }
-    except Exception as final_e:
-        # If even the fallback fails, raise an error
-        raise ValueError(
-            f"Unsupported tool format: {tool_type} from {tool_module}. "
-            "Could not convert to Llama API tool schema. Tool must be a "
-            "Llama-formatted dict, a Pydantic model class, a LangChain StructuredTool, "
-            "or an object with name, description, and schema/args_schema."
-        ) from final_e
+    logger.error(f"Could not convert tool to Llama API format: {tool_type} {tool_repr}. Creating fallback for {name}.")
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+def _lc_tool_to_llama_tool_param(lc_tool: Any) -> completion_create_params.Tool:
+    """Convert LangChain tool to Llama API format using a dispatcher pattern."""
+    converters = [
+        _convert_dict_tool,
+        _convert_pydantic_class_tool,
+        _convert_structured_tool,
+        _convert_parse_method_tool,
+        _convert_route_schema_tool
+    ]
+    for converter in converters:
+        try:
+            return converter(lc_tool)
+        except Exception:
+            continue
+    return _create_minimal_tool(lc_tool)
 
 def _get_json_type_for_annotation(type_name: str) -> str:
     """Helper to convert Python type annotations to JSON schema types."""
@@ -490,9 +410,7 @@ class ChatMetaLlama(BaseChatModel):
         ```
     """
 
-    client: LlamaAPIClient | None = Field(
-        default=None, exclude=True
-    )  # Added default=None
+    _client: LlamaAPIClient | None = PrivateAttr(default=None)
     model_name: str = Field(default="Llama-4-Maverick-17B-128E-Instruct-FP8", alias="model")  # Added default
 
     # Optional parameters for the Llama API, with LangChain common names where applicable
@@ -506,10 +424,20 @@ class ChatMetaLlama(BaseChatModel):
     llama_api_key: Optional[str] = Field(default=None, alias="api_key")
     llama_base_url: Optional[str] = Field(default=None, alias="base_url")
 
+    SUPPORTED_PARAMS: ClassVar[set] = {
+        "model", "messages", "temperature", "max_completion_tokens",
+        "stop", "tools", "stream", "repetition_penalty",
+        "top_p", "top_k", "user"
+    }
+
+    model_config = {
+        "validate_assignment": True,
+        "validate_by_name": True,
+    }
+
     def __init__(
         self,
         *, # Make all args keyword-only for clarity
-        client: Optional[LlamaAPIClient] = None,
         model: Optional[str] = None, # Alias for model_name
         model_name: Optional[str] = None,
         temperature: Optional[float] = None,
@@ -523,70 +451,67 @@ class ChatMetaLlama(BaseChatModel):
         **kwargs: Any, # For any other args BaseChatModel might take
     ) -> None:
         """Initialize the Llama API chat model."""
-        
-        super().__init__(**kwargs)
-
-        # Client
-        self.client = client 
-
-        # Model Name
-        resolved_model_name = model_name
-        if model is not None:
-            resolved_model_name = model
-        if resolved_model_name is None:
-            resolved_model_name = "Llama-4-Maverick-17B-128E-Instruct-FP8" # Explicit default
-        self.model_name = str(resolved_model_name)
-
-        # Llama API Key
+        client = kwargs.pop("client", None)
+        self._client = client
+        # Ensure model_name is always set for Pydantic v2
+        if model_name is None and model is None:
+            model_name = "Llama-4-Maverick-17B-128E-Instruct-FP8"
+        super().__init__(
+            model=model,
+            model_name=model_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            max_completion_tokens=max_completion_tokens,
+            repetition_penalty=repetition_penalty,
+            api_key=api_key,
+            llama_api_key=llama_api_key,
+            base_url=base_url,
+            llama_base_url=llama_base_url,
+            **kwargs
+        )
+        # Remove all post-init model_name logic; rely on Pydantic's default
+        # Keep the rest of the __init__ logic as is
         resolved_api_key = llama_api_key
         if api_key is not None:
             resolved_api_key = api_key
         if resolved_api_key is None:
             resolved_api_key = None # Explicit default from Field(default=None)
         self.llama_api_key = resolved_api_key
-
-        # Llama Base URL
         resolved_base_url = llama_base_url
         if base_url is not None:
             resolved_base_url = base_url
         if resolved_base_url is None:
             resolved_base_url = None # Explicit default from Field(default=None)
         self.llama_base_url = resolved_base_url
-
-        # Temperature
         resolved_temperature = temperature
         if resolved_temperature is None:
             resolved_temperature = None # Explicit default from Field(default=None)
         self.temperature = resolved_temperature
-
-        # Max Tokens
         resolved_max_tokens = max_tokens
         if max_completion_tokens is not None:
             resolved_max_tokens = max_completion_tokens
         if resolved_max_tokens is None:
             resolved_max_tokens = None # Explicit default from Field(default=None)
         self.max_tokens = resolved_max_tokens
-
-        # Repetition Penalty
         resolved_rep_penalty = repetition_penalty
         if resolved_rep_penalty is None:
             resolved_rep_penalty = None # Explicit default from Field(default=None)
         self.repetition_penalty = resolved_rep_penalty
-
-        if self.client is None and self.llama_api_key is not None:
+        if self._client is None and self.llama_api_key is not None:
             self._ensure_client_initialized()
-
-    class Config:
-        allow_population_by_field_name = True
-        validate_assignment = True  # Re-validates when fields are set
 
     @validator("model_name")
     def validate_model_name(cls, v):
+        """Validate that model_name is not empty and warn if not in known models."""
+        if not v:
+            raise ValueError("model_name cannot be empty")
         if v not in VALID_MODELS:
+            model_list = ", ".join(VALID_MODELS)
             warnings.warn(
-                f"Model '{v}' is not in the list of known Llama models. "
-                f"Known models: {', '.join(VALID_MODELS)}",
-                stacklevel=2,  # Help pytest.warns find the source
+                f"Model '{v}' is not in the list of known Llama models.\n"
+                f"Known models: {model_list}\n"
+                f"Your model may still work if the Meta API accepts it, but hasn't been tested.",
+                stacklevel=2,
             )
         return v
 
@@ -594,6 +519,11 @@ class ChatMetaLlama(BaseChatModel):
     def _llm_type(self) -> str:
         """Return type of chat model."""
         return "chat-meta-llama"
+
+    @property
+    def client(self) -> LlamaAPIClient | None:
+        """Provides access to the LlamaAPIClient instance."""
+        return self._client
 
     @property
     def _identifying_params(self) -> Dict[str, Any]:
@@ -608,31 +538,26 @@ class ChatMetaLlama(BaseChatModel):
 
     def _ensure_client_initialized(self) -> None:
         """Ensure that the client is initialized."""
-        # Direct access for attributes like self.llama_api_key and self.client
-        if self.client is None: # Check instance variable
+        if self._client is None:
             current_api_key = self.llama_api_key
             current_base_url = self.llama_base_url
             if not isinstance(current_api_key, str) or not current_api_key:
                 env_api_key = os.environ.get("META_API_KEY")
                 if not env_api_key:
                     raise ValueError(
-                        "Meta Llama API key must be provided via client, "
-                        "direct parameter, or META_API_KEY env var."
+                        "META_API_KEY not found. Set it via environment variable or pass it directly to the constructor."
                     )
-                self.llama_api_key = env_api_key # Set it back on the model attribute
+                self.llama_api_key = env_api_key
                 current_api_key = env_api_key
-
             if not isinstance(current_base_url, str) or not current_base_url:
                 env_base_url = os.environ.get(
                     "META_NATIVE_API_BASE_URL", "https://api.llama.com/v1/"
                 )
-                self.llama_base_url = env_base_url # Set it back
+                self.llama_base_url = env_base_url
                 current_base_url = env_base_url
-
             try:
                 from llama_api_client import LlamaAPIClient as LocalLlamaAPIClient
-                # Assign to self.client so it's stored on the instance
-                self.client = LocalLlamaAPIClient(
+                self._client = LocalLlamaAPIClient(
                     api_key=str(current_api_key),
                     base_url=str(current_base_url),
                 )
@@ -656,33 +581,42 @@ class ChatMetaLlama(BaseChatModel):
                 return True
         return False
 
-    def _generate(
+    async def _agenerate(
         self,
         messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> ChatResult:
-        """Main method for Llama API chat completion call."""
+        """Asynchronously call Llama API for chat completion."""
+        # Directly call the async _generate method
+        return await self._generate(messages, stop, run_manager, **kwargs)
+
+    async def _generate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun | CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """Main method for Llama API chat completion call (now async)."""
         if stop:
             if run_manager:
-                run_manager.on_text(
+                await run_manager.on_text(
                     "Warning: 'stop' sequences are not directly supported by the Llama API client and will be ignored.\n",
                     color="yellow",
                 )
             if "stop_sequences" not in kwargs:
                 kwargs["stop_sequences"] = stop
 
-        # Remove tool_choice parameter if present as it's not supported by Meta Llama API
         if "tool_choice" in kwargs:
             if run_manager:
-                run_manager.on_text(
+                await run_manager.on_text(
                     "Warning: 'tool_choice' parameter is not supported by the Meta Llama API and will be ignored.\n",
                     color="yellow",
                 )
             kwargs.pop("tool_choice")
 
-        # Detect supervisor requests and force stream=False to avoid empty response issues
         if self._detect_supervisor_request(messages) and "stream" not in kwargs:
             logger.debug("Forcing stream=False for supervisor request in _generate")
             kwargs["stream"] = False
@@ -692,16 +626,12 @@ class ChatMetaLlama(BaseChatModel):
         ]
 
         llama_tools: Optional[List[completion_create_params.Tool]] = None
-        bound_tools = kwargs.pop("tools", None)  # From .bind_tools()
+        bound_tools = kwargs.pop("tools", None)
 
         if bound_tools:
             try:
                 llama_tools = [_lc_tool_to_llama_tool_param(t) for t in bound_tools]
-            except ValueError as e:  # Catch errors from tool conversion
-                # Perhaps log a warning or re-raise appropriately
-                # For now, let's assume if tools are bad, we don't send them or raise.
-                # Depending on strictness, this could be an error.
-                # For robustness, let's re-raise as it implies a setup issue.
+            except ValueError as e:
                 raise ValueError(f"Error converting tools for Llama API: {e}")
 
         api_params: Dict[str, Any] = {
@@ -718,21 +648,19 @@ class ChatMetaLlama(BaseChatModel):
         if self.repetition_penalty is not None:
             api_params["repetition_penalty"] = self.repetition_penalty
             
-        # CRITICAL FIX: Filter out unsupported parameters that could cause errors
         api_params = self._filter_unsupported_params(api_params)
         
-        if self.client is None:
+        if self._client is None:
             self._ensure_client_initialized()
         
-        active_client = self.client # Direct access
+        active_client = self._client
         if active_client is None:
             raise RuntimeError("LlamaAPIClient not initialized.")
         
-        # Log the API parameters for debugging
         logger.debug(f"Meta API call params: {api_params}")
         
         try:
-            response_obj: CreateChatCompletionResponse = (
+            response_obj: CreateChatCompletionResponse = await (
                 active_client.chat.completions.create(**api_params)
             )
             logger.debug(f"Meta API response: {response_obj}")
@@ -740,7 +668,6 @@ class ChatMetaLlama(BaseChatModel):
             logger.error(f"Meta API error: {e}")
             raise e
             
-        # Check if completion_message is missing
         if not response_obj.completion_message:
             raise ValueError(
                 "Invalid API response format: completion_message is missing."
@@ -751,9 +678,7 @@ class ChatMetaLlama(BaseChatModel):
 
         content_str = ""
         if msg_data.content:
-            # Handle different content types
             if isinstance(msg_data.content, list):
-                # Handle cases where content could be a list of items (e.g. multimodal)
                 for item in msg_data.content:
                     if (
                         isinstance(item, dict)
@@ -763,7 +688,7 @@ class ChatMetaLlama(BaseChatModel):
                         content_str += item["text"] + " "
                     elif hasattr(item, "text") and isinstance(item.text, str):
                         content_str += item.text + " "
-                    elif isinstance(item, str):  # Plain strings in a list
+                    elif isinstance(item, str):
                         content_str += item + " "
                 content_str = content_str.strip()
             elif hasattr(msg_data.content, "text") and isinstance(
@@ -774,11 +699,10 @@ class ChatMetaLlama(BaseChatModel):
                 content_str = msg_data.content
 
         parsed_tool_calls = []
-        invalid_tool_calls = []  # For Langchain v0.1.17+ support
+        invalid_tool_calls = []
 
         if msg_data.tool_calls:
             for tc in msg_data.tool_calls:
-                # Check if this is a MagicMock with invalid JSON (for tests)
                 if (
                     isinstance(tc, MagicMock)
                     and hasattr(tc, "function")
@@ -787,7 +711,6 @@ class ChatMetaLlama(BaseChatModel):
                     and isinstance(tc.function.arguments, str)
                     and tc.function.arguments.startswith("invalid")
                 ):
-                    # Special case for test_invalid_tool_response_handling
                     invalid_tool_calls.append(
                         {
                             "id": str(tc.id) if tc.id else "unknown_id",
@@ -801,21 +724,18 @@ class ChatMetaLlama(BaseChatModel):
                         }
                     )
                     continue
-                # Otherwise proceed with normal processing
-                # Ensure tc.function and tc.function.name are valid before accessing
                 if (
                     not tc.function
                     or not hasattr(tc.function, "name")
                     or not tc.function.name
                     or not isinstance(tc.function.name, str)
                 ):
-                    # Handle malformed tool call from API
                     invalid_tool_calls.append(
                         {
                             "id": (
                                 str(tc.id) if tc.id else "unknown_id"
-                            ),  # Ensure ID is a string
-                            "name": "unknown_tool_name",  # Use a default string
+                            ),
+                            "name": "unknown_tool_name",
                             "args": (
                                 "{}"
                                 if not tc.function
@@ -829,11 +749,11 @@ class ChatMetaLlama(BaseChatModel):
                 try:
                     args_dict = json.loads(
                         tc.function.arguments or "{}"
-                    )  # Default to empty dict if args is None/empty
+                    )
                     parsed_tool_calls.append(
                         {
                             "id": str(tc.id),
-                            "name": str(tc.function.name),  # Ensure name is a string
+                            "name": str(tc.function.name),
                             "args": args_dict,
                         }
                     )
@@ -841,17 +761,17 @@ class ChatMetaLlama(BaseChatModel):
                     invalid_tool_calls.append(
                         {
                             "id": str(tc.id),
-                            "name": str(tc.function.name),  # Ensure name is a string
+                            "name": str(tc.function.name),
                             "args": str(
                                 tc.function.arguments or ""
-                            ),  # Ensure args is a string
+                            ),
                             "error": f"JSONDecodeError: {e}",
                         }
                     )
 
         ai_message_kwargs: Dict[str, Any] = {
             "content": content_str if content_str else ""
-        }  # Ensure content is at least ""
+        }
         if parsed_tool_calls:
             ai_message_kwargs["tool_calls"] = parsed_tool_calls
         if invalid_tool_calls:
@@ -865,7 +785,7 @@ class ChatMetaLlama(BaseChatModel):
                 if m.metric and m.value is not None
             }
 
-        generation_info: Dict[str, Any] = {  # Ensure type for generation_info
+        generation_info: Dict[str, Any] = {
             "finish_reason": msg_data.stop_reason,
             "model_name": self.model_name,
         }
@@ -1074,78 +994,9 @@ class ChatMetaLlama(BaseChatModel):
                     ]
             
             def invoke(self, input_data, config=None, **kwargs):
-                """Process messages and return JSON conforming to the schema."""
-                messages = input_data
-                
-                # Handle various input types
-                if isinstance(input_data, dict) and "input" in input_data:
-                    # Handle dict with 'input' key (common in RunnableSequence)
-                    user_input = input_data["input"]
-                    if isinstance(user_input, str):
-                        messages = [HumanMessage(content=user_input)]
-                    elif isinstance(user_input, list):
-                        messages = user_input
-                    else:
-                        messages = [HumanMessage(content=str(user_input))]
-                elif isinstance(input_data, str):
-                    # Handle plain string input as a human message
-                    messages = [HumanMessage(content=input_data)]
-                    
-                # Merge config and kwargs
-                invoke_kwargs = {}
-                if config:
-                    if isinstance(config, dict):
-                        invoke_kwargs.update(config)
-                
-                # Add kwargs, but don't override config values with None
-                for k, v in kwargs.items():
-                    if k not in invoke_kwargs or v is not None:
-                        invoke_kwargs[k] = v
-                
-                # Filter out LangChain-specific parameters
-                invoke_kwargs = self._filter_params(invoke_kwargs)
-                
-                # Add JSON schema instruction
-                enhanced_messages = self._add_schema_instruction(messages)
-                
-                # Call the LLM
-                result = self.base_llm.invoke(enhanced_messages, **invoke_kwargs)
-                
-                # Get the content string
-                if hasattr(result, "content"):
-                    content = result.content
-                else:
-                    content = str(result)
-                    
-                # Parse JSON response
-                return self._fix_response_format(content)
-            
-            def stream(self, input_data, config=None, **stream_kwargs):
-                """We don't support streaming for structured output.
-                Just do a regular invoke and yield a single chunk."""
-                from langchain_core.messages import AIMessageChunk
-                from langchain_core.outputs import ChatGenerationChunk
-                
-                # Merge config and kwargs
-                kwargs = {}
-                if config:
-                    if isinstance(config, dict):
-                        kwargs.update(config)
-                
-                # Add stream_kwargs, but don't override config values with None
-                for k, v in stream_kwargs.items():
-                    if k not in kwargs or v is not None:
-                        kwargs[k] = v
-                
-                # Filter out LangChain-specific parameters
-                kwargs = self._filter_params(kwargs)
-                
-                result = self.invoke(input_data, **kwargs)
-                if isinstance(result, str):
-                    yield ChatGenerationChunk(message=AIMessageChunk(content=result))
-                else:
-                    yield ChatGenerationChunk(message=AIMessageChunk(content=json.dumps(result)))
-            
+                """Sync invoke: calls async ainvoke under the hood."""
+                return asyncio.run(self.ainvoke(input_data, config, **kwargs))
+
             async def ainvoke(self, input_data, config=None, **invoke_kwargs):
                 """Process messages asynchronously and return JSON conforming to the schema."""
                 messages = input_data
@@ -1192,6 +1043,13 @@ class ChatMetaLlama(BaseChatModel):
                     
                 # Parse JSON response
                 return self._fix_response_format(content)
+            
+            def stream(self, input_data, config=None, **stream_kwargs):
+                """Sync stream: calls async astream under the hood."""
+                async def _stream():
+                    async for chunk in self.astream(input_data, config, **stream_kwargs):
+                        yield chunk
+                return _stream()
             
             async def astream(self, input_data, config=None, **stream_kwargs):
                 """We don't support streaming for structured output.
@@ -1356,27 +1214,48 @@ class ChatMetaLlama(BaseChatModel):
         """
         Filter parameters to only include those supported by the Meta LLM API.
         Uses a whitelist approach instead of a blacklist.
-        
+
         Args:
             params: Dictionary of parameters to filter
-            
         Returns:
             Filtered dictionary with only supported parameters
         """
-        # Meta API supported parameters (based on their documentation)
-        supported_params = {
-            "model", "messages", "temperature", "max_completion_tokens", 
-            "stop", "tools", "stream", "repetition_penalty", 
-            "top_p", "top_k", "user"
-        }
-        
-        # Only keep supported parameters
-        filtered_params = {}
-        for key, value in params.items():
-            if key in supported_params:
-                filtered_params[key] = value
-        
-        return filtered_params
+        return {key: value for key, value in params.items() if key in self.SUPPORTED_PARAMS}
+
+    def _prepare_api_params(
+        self,
+        messages: list,
+        tools: Optional[list] = None,
+        **kwargs
+    ) -> dict:
+        """
+        Prepare API parameters, filtering unsupported ones.
+
+        Args:
+            messages: List of message dicts for the API.
+            tools: Optional list of tool dicts.
+            **kwargs: Additional parameters.
+
+        Returns:
+            Dictionary of parameters ready for the Meta API.
+
+        Example:
+            >>> llama = ChatMetaLlama(model_name="Llama-4-Maverick-17B-128E-Instruct-FP8")
+            >>> llama._prepare_api_params([{"role": "user", "content": "hi"}], tools=[{"type": "function", ...}])
+            {'model': 'Llama-4-Maverick-17B-128E-Instruct-FP8', 'messages': [{'role': 'user', 'content': 'hi'}], 'tools': [{...}]}
+        """
+        api_params = {k: v for k, v in kwargs.items() if k in self.SUPPORTED_PARAMS}
+        api_params["model"] = self.model_name
+        api_params["messages"] = messages
+        if self.temperature is not None:
+            api_params["temperature"] = self.temperature
+        if self.max_tokens is not None:
+            api_params["max_completion_tokens"] = self.max_tokens
+        if self.repetition_penalty is not None:
+            api_params["repetition_penalty"] = self.repetition_penalty
+        if tools:
+            api_params["tools"] = tools
+        return api_params
 
 
 # Variables to help with consistent mock creation in tests
