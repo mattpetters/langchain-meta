@@ -3,419 +3,153 @@ description:
 globs: 
 alwaysApply: true
 ---
-# Meta LLM Integration Rules
+- Use the llama-api-client source for integration help
+- Offical docs are here https://llama.developer.meta.com/docs/guides/best-practices/?team_id=1738085153773497 @Web
 
-## Overview
-These rules provide guidance on properly integrating Meta's LLM APIs with LangChain and LangGraph, based on your `langchain_meta` implementation.
+Tool calling with Llama API
+Introduction
+You can use tool calling to interface Llama API with external tools that you provide. Tool calling enables you to expand the capabilities of a Llama model in order to gather new information that is not readily available to the model, or to take actions such as sending emails or calling other APIs.
+When you enable tool calling via the API, the model automatically decides if it needs one or more of the available tools to respond to your prompt, and if so will tell you which tools it would like to use and how. You will then execute the tool and send back the results as part of a chat completion, so that the model can incorporate the information into its next response.
+When to use tool calling
+Tool calling can be used for a number of different purposes, which can broadly be grouped as finding information and performing actions.
+Finding information
+Tool calling enables access to knowledge not included in the model’s training data. Below are some cases where tool calling could help retrieve external information.
+•Fetching real-time data: Your request may require access to frequently updated information, such as sports scores or news headlines, weather data when planning a beach trip, or the latest stock values for financial analysis.
+•Performing calculations: While language models excel at reasoning, they typically don't perform well with raw arithmetic or complex calculations. Like a human, an AI model can use a basic calculator for math involving large numbers. For specialized calculations such as tax accounting or internal projections, create a custom tool for Llama.
+•Search the web: Use a search engine to collect additional information. This provides a general solution for fetching real-time data when you don't want to create a specific tool for each information source.
+•Access databases: Access your own private databases to help answer questions about your business or customers. Include up-to-date pricing information or availability.
+Performing actions
+Beyond finding information, you can use tools to take actions on your behalf. Multi-turn actions enable Llama to become a true AI agent, taking actions and reasoning about results to determine next steps and potentially the next tool.
+While the options for tools are endless, here are some common use cases:
+•Sending messages: Enable Llama to send emails or chat messages proactively
+•Triggering jobs: Start long-running jobs or workflows to run in the background
+•Calling other APIs: Make API calls to external services outside of the model
+How to use tool calling
+Prerequisites
+Before you begin, ensure you have:
+•A valid Llama API key
+•Python 3.7 or higher
+Setting up your environment
+To use tool calling with Llama API, you'll need to set up authentication using your Llama API key, which you’ll store in an environment variable for now.
+Here's how to set up your Python environment for making API calls:
+Python
+1234567891011
+import os
+import requests
+import json
 
-### Use Meta-Specific Agent Factory
+os.environ["LLAMA_API_KEY"] = "your_api_key_here"
 
-**Description**: Use a dedicated agent factory function for Meta LLMs to handle the nuances of Meta's tool calling format and ensure compatibility.
+# Load API key from environment variable
+LLAMA_API_KEY = os.environ.get('LLAMA_API_KEY')
 
-**Bad Example**:
-```python
-def agent_factory(llm, tools, system_prompt_text):
-    """Generic agent factory that doesn't handle Meta-specific needs."""
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt_text),
-        MessagesPlaceholder(variable_name="messages"),
-    ])
-    return prompt | llm.bind(tools=tools)
-```
+# Define the base URL
 
-**Good Example**:
-```python
-def meta_agent_factory(
-    llm: BaseChatModel,
-    tools: List[StructuredTool] = None,
-    system_prompt_text: str = "",
-    output_schema = None,
-    disable_streaming: bool = False,
-):
-    """Meta-specific agent factory that handles tool formatting and schema output."""
-    # Use structured output if schema is provided
-    if output_schema is not None:
-        bound_llm = llm.with_structured_output(output_schema, include_raw=False)
-    else:
-        bound_llm = llm
-    
-    # Set streaming explicitly if needed
-    if disable_streaming:
-        bound_llm = bound_llm.bind(stream=False)
-    
-    # Create a basic prompt
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt_text),
-        MessagesPlaceholder(variable_name="messages"),
-    ])
-    
-    # Return the full chain
-    return prompt | bound_llm
-```
+Creating a tool definition
+The tool (singular) role is a special role that indicates to the model that the results come from an external tool. When the model uses a tool, it includes a tools (plural) field in the response. After you execute the tool call, return the results to the model using the tool role.
+To instruct a Llama model on how to use a tool, create a tool definition that includes:
+•The tool’s name
+•A description of what the tool does
+•The parameters that the tool accepts
+The chat completion API accepts a tools parameter, which is an array of tool definitions. This is separate from the messages parameter, which contains the conversation history. It is not necessary to include tool information in the system prompt, or even request that the model use tools at all. If tools are included, the model will by default use them if it decides they are necessary.
+Python
+123456789101112131415161718192021222324252627282930313233343536
+get_weather_tool = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Retrieve the current temperature for a specified location",
+        "parameters": {
+        "properties": {
+            "location": {
+            "type": "string",
+            "description": "The city, state, or country for which to fetch the temperature"
 
-**Pattern**: Generic agent creation that doesn't account for Meta-specific needs.
+The model will use the provided tool definition to infer whether a tool should be invoked, then respond with a message indicating which tool it wants to use.
+JSON response
+{
+  "completion_message": {
+    "content": {
+      "type": "text",
+      "text": ""
+    },
+    "role": "assistant",
+    "stop_reason": "tool_calls",
+    "tool_calls": [
+      {
 
-### Encapsulate Tool Formatting Logic
+Invoking your tool
+Llama API does not have access to any execution environment, and in many cases will not have access to the tool you have defined. Hence your application must execute the tool call generated by the model and return the results.
 
-**Description**: Encapsulate tool formatting logic within the ChatMetaLlama class rather than exposing it to users of the class.
+Return the results to the model using the tool role, as shown below.
+Python
+123456789101112131415161718192021222324252627282930
+payload = {
+	"model": "Llama-3.3-8B-Instruct",
+	"messages": [
+		{"role": "user", "content": "What is the weather in Menlo Park?"},
+		{
+			"role": "assistant", "content": "", "stop_reason": "tool_calls",
+			"tool_calls": [{
+                "id": "bb3660bc-7992-4b0c-b1af-04aa424f559c",
+                "function": {
+                    "name": "get_weather",
 
-**Bad Example**:
-```python
-# In application code
-def prepare_tool_for_meta(tool):
-    # Complex conversion logic exposed in application code
-    if isinstance(tool, dict):
-        return tool
-    elif hasattr(tool, "name") and hasattr(tool, "description"):
-        return {
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": getattr(tool, "parameters", {"type": "object", "properties": {}})
+Consider using llama-stack-apps or another similar application to execute the tool call and retrieve the results.
+Finally, the model uses the results to return an answer to the original user question.
+JSON response
+{
+  "completion_message": {
+    "content": {
+      "type": "text",
+      "text": "The current temperature in Menlo Park is 47\u00b0F."
+    },
+    "role": "assistant",
+    "stop_reason": "stop",
+    "tool_calls": []
+  },
+
+Testing & debugging
+Because tool calls are executed outside of the model, you need to test and debug them separately. However, since there is no requirement to actually call the function, for testing purposes you can return a mock response with the output you expect from your tool. This means you can easily experiment with different tools before they are actually built, allowing you to iterate on your tool definitions and optimize your prompts prior to committing to development.
+Sometimes, the model may not call the tool even if it is available. This is because the model may not believe that the tool is the best option for the user's request.
+
+To help the model call the right tool, you can try the following:
+•Provide some examples of how the tool should be used in the prompt
+•Modify the tool definition to include more specific instructions or examples
+•If you know the tool should be used, you can directly ask the model to use the tool in the prompt
+Example tools
+Tool definitions are entirely up to you, and can be as specific or broad as you would like. Tools often correspond to a specific web API or service, but could also be used to call a library function or perform a calculation. Here are some examples of tools you might use with Llama.
+Search the web
+JSON
+12345678910111213141516
+{
+  "type": "function",
+  "function": {
+    "name": "web_search",
+    "description": "Search the web for information",
+    "parameters": {
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "The query to search for"
+
+Use Wolfram Alpha as a calculator
+JSON
+1234567891011121314
+{
+    "type": "function",
+    "function": {
+        "name": "calculate",
+        "description": "Complete mathematical calculations using Wolfram Alpha",
+        "properties": {
+            "expression": {
+                "type": "string",
+                "description": "The mathematical expression to evaluate"
             }
-        }
-    else:
-        raise ValueError(f"Unsupported tool format: {type(tool)}")
 
-# Using the function
-meta_llm = ChatMetaLlama(...)
-formatted_tools = [prepare_tool_for_meta(tool) for tool in tools]
-result = meta_llm.invoke(messages, tools=formatted_tools)
-```
-
-**Good Example**:
-```python
-# In ChatMetaLlama class
-def _lc_tool_to_llama_tool_param(lc_tool: Any) -> dict:
-    """Converts a LangChain tool to the Llama API tool parameter format.
-    
-    This method is internal to the ChatMetaLlama class and handles all the nuances
-    of converting different tool formats to Meta's expected format.
-    """
-    # Internal conversion logic...
-
-# In bind_tools method
-def bind_tools(self, tools, **kwargs):
-    """Bind tools to the LLM in a Meta API compatible way."""
-    logger.debug(f"bind_tools called with {len(tools)} tools")
-    
-    # Handle any tool_choice that might be in kwargs
-    if "tool_choice" in kwargs:
-        # Log a warning but continue
-        logger.debug(f"bind_tools: detected tool_choice: {kwargs['tool_choice']}. "
-                    f"This will be ignored during API calls to Meta.")
-    
-    # For Meta API, we just need to bind the tools, tool_choice is not supported
-    return self.bind(tools=tools, **kwargs)
-
-# Using the class
-meta_llm = ChatMetaLlama(...)
-# No need for manual formatting - just pass the tools directly
-bound_llm = meta_llm.bind_tools(tools)
-result = bound_llm.invoke(messages)
-```
-
-**Pattern**: Tool formatting logic exposed in application code instead of encapsulated within the LLM class.
-
-### Handle Tool Calling Differences
-
-**Description**: Handle the differences between Meta's tool calling format and OpenAI's format to ensure compatibility with existing LangChain and LangGraph components.
-
-**Bad Example**:
-```python
-def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-    """Generate method that doesn't handle Meta-specific response format."""
-    # Convert messages to Meta format
-    meta_messages = [self._convert_message(m) for m in messages]
-    
-    # Make the API call
-    response = self.client.chat.completions.create(
-        model=self.model_name,
-        messages=meta_messages,
-        **kwargs
-    )
-    
-    # Extract content directly without checking for correct format
-    content = response.choices[0].message.content
-    
-    # Return without proper handling of tool calls
-    return ChatResult(
-        generations=[ChatGeneration(message=AIMessage(content=content))]
-    )
-```
-
-**Good Example**:
-```python
-def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-    """Generate method that handles Meta-specific tool calling format."""
-    # Convert messages to Meta format
-    llama_messages = [_lc_message_to_llama_message_param(m) for m in messages]
-    
-    # Handle tools if provided
-    llama_tools = None
-    bound_tools = kwargs.pop("tools", None)
-    if bound_tools:
-        try:
-            llama_tools = [_lc_tool_to_llama_tool_param(t) for t in bound_tools]
-        except ValueError as e:
-            raise ValueError(f"Error converting tools for Llama API: {e}")
-    
-    # Prepare API parameters
-    api_params = {
-        "model": self.model_name,
-        "messages": llama_messages,
-        **kwargs,
-    }
-    if llama_tools:
-        api_params["tools"] = llama_tools
-    
-    # Make the API call
-    response_obj = self.client.chat.completions.create(**api_params)
-    
-    # Handle different response format from Meta API
-    if not response_obj.completion_message:
-        raise ValueError("Invalid API response format: completion_message is missing.")
-    
-    msg_data = response_obj.completion_message
-    
-    # Extract content properly based on format
-    content_str = self._extract_content_from_response(msg_data)
-    
-    # Process tool calls from Meta's format to LangChain format
-    parsed_tool_calls = []
-    if msg_data.tool_calls:
-        for tc in msg_data.tool_calls:
-            try:
-                args_dict = json.loads(tc.function.arguments or "{}")
-                parsed_tool_calls.append({
-                    "id": str(tc.id),
-                    "name": str(tc.function.name),
-                    "args": args_dict,
-                })
-            except json.JSONDecodeError as e:
-                # Handle invalid JSON in arguments
-                parsed_tool_calls.append({
-                    "id": str(tc.id),
-                    "name": str(tc.function.name),
-                    "args": tc.function.arguments or "",
-                    "error": f"JSONDecodeError: {e}",
-                })
-    
-    # Construct AI message with proper format
-    ai_message_kwargs = {"content": content_str if content_str else ""}
-    if parsed_tool_calls:
-        ai_message_kwargs["tool_calls"] = parsed_tool_calls
-    
-    # Return properly formatted result
-    return ChatResult(
-        generations=[ChatGeneration(
-            message=AIMessage(**ai_message_kwargs),
-            generation_info={"finish_reason": msg_data.stop_reason}
-        )]
-    )
-```
-
-**Pattern**: Simplified API response handling that doesn't account for Meta's specific format.
-
-### Implement Structured Output for Supervisors
-
-**Description**: Implement proper structured output handling for supervisor agents that need to return specific fields like "next" for routing.
-
-**Bad Example**:
-```python
-def create_supervisor_chain(llm):
-    """Creates the supervisor chain without proper structured output."""
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", SUPERVISOR_PROMPT),
-        MessagesPlaceholder(variable_name="messages"),
-    ])
-    
-    # No structured output handling
-    return prompt | llm
-```
-
-**Good Example**:
-```python
-def create_supervisor_chain(llm):
-    """Creates the supervisor chain with structured output for routing."""
-    # Define schema for supervisor output
-    class RouteSchema(BaseModel):
-        """Schema for supervisor routing decisions."""
-        next: str = Field(
-            description="The next agent to route to or END to finish.",
-            enum=["EmailAgent", "SlackAgent", "FinanceAgent", "GeneralAgent", "END"]
-        )
-    
-    # Use meta_agent_factory with output_schema
-    supervisor_chain = meta_agent_factory(
-        llm=llm,
-        output_schema=RouteSchema,
-        system_prompt_text=SUPERVISOR_PROMPT,
-        disable_streaming=True  # Critical: Always disable streaming for structured output
-    )
-    
-    return supervisor_chain
-```
-
-**Pattern**: Supervisor chains without proper structured output handling for routing decisions.
-
-### Consistent JSON Extraction
-
-**Description**: Use a consistent approach to extracting JSON from LLM responses, especially for structured output and routing decisions.
-
-**Bad Example**:
-```python
-def extract_routing_decision(content):
-    """Inconsistent JSON extraction."""
-    try:
-        # Try direct parsing
-        return json.loads(content)
-    except json.JSONDecodeError:
-        # Fallback to regex for simple cases
-        match = re.search(r'next["\s:]+([^"\s,}]+)', content)
-        if match:
-            return {"next": match.group(1)}
-        return {"next": "END"}  # Default
-```
-
-**Good Example**:
-```python
-def extract_json_response(content):
-    """
-    Extract JSON from various response formats consistently.
-    
-    Handles:
-    - Direct JSON objects
-    - JSON in code blocks with backticks
-    - JSON-like patterns in text
-    """
-    if not isinstance(content, str):
-        return content
-        
-    # Try direct JSON parsing
-    content = content.strip()
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        pass
-        
-    # Try to extract JSON from code blocks
-    if "```" in content:
-        # Try JSON code blocks
-        match = re.search(r'```(?:json)?\s*(.*?)\s*```', content, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(1).strip())
-            except:
-                pass
-    
-    # Try to find JSON objects in text
-    match = re.search(r'({[\s\S]*?})', content)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except:
-            pass
-            
-    # Return the original content if all parsing attempts fail
-    return content
-```
-
-**Pattern**: Inconsistent or simplified JSON extraction that may fail for certain response formats.
-
-### Handle Streaming Correctly
-
-**Description**: Handle streaming correctly for Meta LLMs, especially when integrating with LangGraph which expects certain behavior during streaming.
-
-**Bad Example**:
-```python
-async def _agenerate_stream(self, messages, stop=None, run_manager=None, **kwargs):
-    """Streaming implementation that doesn't handle Meta-specific needs."""
-    stream = await self.client.chat.completions.create(
-        model=self.model_name,
-        messages=[self._convert_message(m) for m in messages],
-        stream=True,
-        **kwargs
-    )
-    
-    async for chunk in stream:
-        token = chunk.choices[0].delta.content or ""
-        # Yield without handling tool calls or special formats
-        yield ChatGenerationChunk(message=AIMessageChunk(content=token))
-```
-
-**Good Example**:
-```python
-async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
-    """Asynchronous generate method with proper streaming support."""
-    # Handle streaming explicitly
-    if kwargs.get("stream", False):
-        async for chunk in self._astream_events(messages, stop, run_manager, **kwargs):
-            yield chunk
-        return
-    
-    # Non-streaming implementation (similar to _generate)
-    # ...
-
-async def _astream_events(self, messages, stop=None, run_manager=None, **kwargs):
-    """Stream events with proper handling of Meta's format."""
-    # Convert messages and prepare API call (like in _generate)
-    # ...
-    
-    # Enable streaming
-    api_params["stream"] = True
-    
-    # Open the stream
-    stream = await self.client.chat.completions.create(**api_params)
-    
-    # Track the accumulated content and tool calls
-    content_so_far = ""
-    tool_calls_so_far = []
-    tool_call_in_progress = None
-    
-    # Process the stream
-    async for chunk in stream:
-        # Handle various chunk formats from Meta API
-        if hasattr(chunk, "completion_message"):
-            # Handle completion message chunk
-            if chunk.completion_message.content:
-                content_so_far += self._extract_content_from_chunk(chunk.completion_message.content)
-                yield ChatGenerationChunk(message=AIMessageChunk(content=content_so_far))
-            
-            # Handle tool calls in chunks
-            if chunk.completion_message.tool_calls:
-                for tc in chunk.completion_message.tool_calls:
-                    # Process tool call chunk
-                    if not tool_call_in_progress or tool_call_in_progress["id"] != tc.id:
-                        # New tool call
-                        tool_call_in_progress = {
-                            "id": tc.id,
-                            "name": tc.function.name,
-                            "args": tc.function.arguments or ""
-                        }
-                    else:
-                        # Continue existing tool call
-                        tool_call_in_progress["args"] += tc.function.arguments or ""
-                    
-                    # Add to list if complete
-                    if tc.complete:
-                        try:
-                            # Parse arguments
-                            args_dict = json.loads(tool_call_in_progress["args"])
-                            tool_calls_so_far.append({
-                                "id": tool_call_in_progress["id"],
-                                "name": tool_call_in_progress["name"],
-                                "args": args_dict
-                            })
-                            # Yield tool call chunk
-                            yield ChatGenerationChunk(
-                                message=AIMessageChunk(content="", tool_calls=tool_calls_so_far)
-                            )
-                        except json.JSONDecodeError:
-                            # Handle invalid JSON
-                            pass
-                        tool_call_in_progress = None
-```
-
-**Pattern**: Simplified streaming implementation that doesn't handle Meta-specific formats and tool calls.
+Was this page helpful?
+Introduction
+When to use tool calling
+How to use tool calling
+Testing & debugging
+Example tools
