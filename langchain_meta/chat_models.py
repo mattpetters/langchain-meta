@@ -1,429 +1,58 @@
 # https://python.langchain.com/docs/how_to/custom_chat_model/
 
-import asyncio
 import json
+import logging
 import os
 import warnings
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, cast, ClassVar
-from unittest.mock import MagicMock
-from datetime import datetime
-import re
-
-from langchain_core.callbacks.manager import (
-    AsyncCallbackManagerForLLMRun,
-    CallbackManagerForLLMRun,
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Type,
+    Union,
 )
+
+from langchain_core.language_models.base import LanguageModelInput
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
-    AIMessageChunk,
     BaseMessage,
-    HumanMessage,
     SystemMessage,
-    ToolMessage,
 )
-from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_core.runnables import RunnableConfig
-from pydantic.v1 import Field, validator
-from pydantic.v1.fields import FieldInfo
-from pydantic.v1 import BaseModel as PydanticV1BaseModel
-from pydantic import model_validator, PrivateAttr
-
-from llama_api_client import APIError, LlamaAPIClient
-from llama_api_client.types import MessageParam  # Explicitly for input messages
+from langchain_core.output_parsers.openai_tools import (
+    JsonOutputKeyToolsParser,
+    PydanticToolsParser,
+)
+from langchain_core.runnables import Runnable, RunnableLambda, RunnablePassthrough
+from langchain_core.tools import BaseTool
+from llama_api_client import AsyncLlamaAPIClient, LlamaAPIClient
 from llama_api_client.types.chat import (
     completion_create_params,
-)  # For input tools format
-from llama_api_client.types.create_chat_completion_response import (
-    CreateChatCompletionResponse,
-)  # For output
-from llama_api_client.types.create_chat_completion_response_stream_chunk import (
-    CreateChatCompletionResponseStreamChunk,
-)  # For streaming output
+)
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    SecretStr,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+)
 
-# ToolResponseMessage is implicitly handled by constructing a dict with role=\"tool\"
+# Import the mixin
+from langchain_meta.chat_meta_llama.chat_async import AsyncChatMetaLlamaMixin
 
-# Add logging for debugging
-import logging
+from .chat_meta_llama.chat_sync import SyncChatMetaLlamaMixin
+from .chat_meta_llama.serialization import (
+    _lc_message_to_llama_message_param,
+)
 
 logger = logging.getLogger(__name__)
-
-
-# Helper to convert Langchain BaseMessage to Llama API's MessageParam format
-def _lc_message_to_llama_message_param(message: BaseMessage) -> MessageParam:
-    """Converts a LangChain message to a Llama API MessageParam dictionary."""
-    if isinstance(message, HumanMessage):
-        if not isinstance(message.content, str):
-            # This validation remains as HumanMessage content is flexible but our API expects str
-            raise ValueError(
-                f"HumanMessage content for Llama API must be a string, got {type(message.content)}"
-            )
-        return {"role": "user", "content": message.content}
-    elif isinstance(message, AIMessage):
-        if message.tool_calls:
-            llama_tool_calls = []
-            # Tool calls on AIMessage can be list of dicts or list of ToolCall objects
-            for tc in message.tool_calls:
-                tc_id = None
-                tc_name = "unknown_tool"
-                tc_args = {}
-
-                if isinstance(tc, dict):
-                    # Handle dict case (from older tests or direct construction)
-                    tc_id = str(tc.get("id")) if tc.get("id") else None
-                    tc_name = str(tc.get("name", "unknown_tool"))
-                    tc_args = tc.get("args", {})
-                elif hasattr(tc, "id") and hasattr(tc, "name") and hasattr(tc, "args"):
-                    # Handle ToolCall object case (more standard)
-                    tc_id = str(tc.id) if tc.id else None
-                    tc_name = str(tc.name) if tc.name else "unknown_tool"
-                    tc_args = tc.args or {}
-                else:
-                    # Handle unexpected format
-                    logger.warning(f"Skipping unexpected tool call format: {type(tc)}")
-                    continue
-
-                # Generate fallback ID if needed
-                final_tc_id = tc_id if tc_id else f"tc_{len(llama_tool_calls)}"
-
-                # Convert args dict to JSON string
-                try:
-                    tc_args_str = json.dumps(tc_args)
-                except Exception as e:
-                    logger.warning(
-                        f"Could not serialize tool call args for {tc_name=}: {e}",
-                        exc_info=True,
-                    )
-                    tc_args_str = "{}"
-
-                llama_tool_calls.append(
-                    {
-                        "id": final_tc_id,
-                        "type": "function",
-                        "function": {"name": tc_name, "arguments": tc_args_str},
-                    }
-                )
-
-            content_value = message.content or None
-            return {
-                "role": "assistant",
-                "content": content_value,
-                "tool_calls": llama_tool_calls,
-            }
-
-        # Regular AIMessage without tool calls
-        content_value = message.content
-        # No need for string conversion checks, AIMessage validation ensures content is str or list.
-        # If it's a list, the downstream API call needs to handle it (outside this func).
-        # For now, assume if not tool_calls, content is expected to be string-like by Llama.
-        # If content is list, maybe join? Or pass as-is if API supports?
-        # Let's assume str() is safe fallback if we get list here, although AIMessage should prevent non-str/list.
-        if not isinstance(content_value, str):
-            # Log warning if content isn't string (and not tool_calls case)
-            logger.warning(
-                f"AIMessage content was not a string: {type(content_value)}. Converting to string."
-            )
-            content_value = str(content_value)
-
-        return {"role": "assistant", "content": content_value or ""}
-    elif isinstance(message, SystemMessage):
-        if not isinstance(message.content, str):
-            # Keep this check, SystemMessage content should be str
-            raise ValueError(
-                f"SystemMessage content for Llama API must be a string, got {type(message.content)}"
-            )
-        return {"role": "system", "content": message.content}
-    elif isinstance(message, ToolMessage):
-        # No need to check for tool_call_id, ToolMessage validation enforces it.
-        tool_content_str: str
-        # No need for complex content conversion, ToolMessage validation handles it.
-        if isinstance(message.content, (dict, list)):
-            try:
-                tool_content_str = json.dumps(message.content)
-            except Exception as e:
-                logger.warning(
-                    "Failed to dump ToolMessage complex content to JSON string",
-                    exc_info=True,
-                )
-                tool_content_str = str(message.content)  # Fallback to str()
-        elif isinstance(message.content, str):
-            tool_content_str = message.content
-        else:
-            # Should be unreachable due to ToolMessage validation, but keep str() as fallback
-            logger.warning(
-                f"Unexpected ToolMessage content type: {type(message.content)}. Converting to string."
-            )
-            tool_content_str = str(message.content)
-
-        return {
-            "role": "tool",
-            "content": tool_content_str,
-            "tool_call_id": message.tool_call_id,  # ID is guaranteed by ToolMessage validation
-        }
-    else:
-        # Keep the final fallback for truly unknown message types
-        raise ValueError(f"Unsupported LangChain message type: {type(message)}")
-
-
-# Helper to convert LangChain Tool/Function definitions to Llama API's tool format
-
-
-def _convert_dict_tool(lc_tool: Any) -> dict:
-    """Convert a dict tool already in Llama API format."""
-    if (
-        isinstance(lc_tool, dict)
-        and "function" in lc_tool
-        and isinstance(lc_tool["function"], dict)
-    ):
-        return lc_tool
-    raise ValueError("Not a dict tool")
-
-
-def _convert_pydantic_class_tool(lc_tool: Any) -> dict:
-    """Convert a Pydantic model class tool."""
-    if isinstance(lc_tool, type):
-        name = getattr(lc_tool, "__name__", "UnnamedTool")
-        description = getattr(lc_tool, "__doc__", "") or ""
-        parameters = {}
-        if hasattr(lc_tool, "schema") and callable(getattr(lc_tool, "schema")):
-            parameters = lc_tool.schema()
-            logger.debug(f"Used schema() method to get parameters for {name}")
-        elif hasattr(lc_tool, "model_json_schema") and callable(
-            getattr(lc_tool, "model_json_schema")
-        ):
-            parameters = lc_tool.model_json_schema()
-            logger.debug(
-                f"Used model_json_schema() method to get parameters for {name}"
-            )
-        if not isinstance(parameters, dict):
-            logger.warning(
-                f"Schema for {name} is not a dict: {type(parameters)}. Using empty schema."
-            )
-            parameters = {"type": "object", "properties": {}}
-        return {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": parameters,
-            },
-        }
-    raise ValueError("Not a Pydantic class tool")
-
-
-def _convert_structured_tool(lc_tool: Any) -> dict:
-    """Convert a StructuredTool or similar object."""
-    if hasattr(lc_tool, "name") and hasattr(lc_tool, "description"):
-        name = getattr(lc_tool, "name", "unnamed_tool")
-        description = getattr(lc_tool, "description", "")
-        if not isinstance(name, str):
-            logger.warning(
-                f"Tool name is not a string: {type(name)}. Converting to string."
-            )
-            name = str(name)
-        if not isinstance(description, str):
-            logger.warning(
-                f"Tool description is not a string: {type(description)}. Converting to string."
-            )
-            description = str(description)
-
-        # Handle objects with name, description, and schema_ (Case 3 from original)
-        if hasattr(lc_tool, "schema_"):
-            schema_ = getattr(lc_tool, "schema_", None)
-            if isinstance(schema_, dict):
-                logger.debug(f"Using schema_ attribute for tool {name}")
-                return {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": description,
-                        "parameters": schema_,
-                    },
-                }
-            else:
-                logger.warning(
-                    f"Tool {name} has schema_ attribute, but it's not a dict: {type(schema_)}. Proceeding to args_schema."
-                )
-
-        parameters_schema = {"type": "object", "properties": {}}
-        if hasattr(lc_tool, "args_schema"):
-            args_schema = lc_tool.args_schema
-            if args_schema is not None:
-                try:
-                    if (
-                        isinstance(args_schema, type)
-                        and hasattr(args_schema, "schema")
-                        and callable(getattr(args_schema, "schema"))
-                    ):
-                        parameters_schema = args_schema.schema()
-                        logger.debug(
-                            f"Extracted schema from Pydantic v1 model class {args_schema.__name__} for {name}"
-                        )
-                    elif hasattr(args_schema, "model_json_schema") and callable(
-                        getattr(args_schema, "model_json_schema")
-                    ):
-                        parameters_schema = args_schema.model_json_schema()
-                        logger.debug(
-                            f"Extracted schema using model_json_schema() for {name}"
-                        )
-                    elif hasattr(args_schema, "schema") and callable(
-                        getattr(args_schema, "schema")
-                    ):
-                        parameters_schema = args_schema.schema()
-                        logger.debug(
-                            f"Extracted schema using schema() method on instance for {name}"
-                        )
-                    elif isinstance(args_schema, dict):
-                        parameters_schema = args_schema
-                        logger.debug(f"Using direct dict schema for {name}")
-                    # Removed schema_ check here as it's handled above
-                    elif hasattr(args_schema, "__annotations__"):
-                        properties = {}
-                        for (
-                            field_name,
-                            field_type,
-                        ) in args_schema.__annotations__.items():
-                            type_name = getattr(field_type, "__name__", str(field_type))
-                            json_type = _get_json_type_for_annotation(type_name)
-                            properties[field_name] = {
-                                "type": json_type,
-                                "description": f"The {field_name} parameter",
-                            }
-                        parameters_schema = {
-                            "type": "object",
-                            "properties": properties,
-                            "required": list(args_schema.__annotations__.keys()),
-                        }
-                        logger.debug(f"Built schema from __annotations__ for {name}")
-                except Exception as e:
-                    logger.warning(
-                        f"Error extracting schema from {name}'s args_schema: {e}. Using empty schema.",
-                        exc_info=True,
-                    )
-                    parameters_schema = {
-                        "type": "object",
-                        "properties": {},
-                    }  # Ensure fallback on error
-            else:
-                logger.debug(f"Tool {name} has args_schema=None. Using empty schema.")
-        return {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": parameters_schema,
-            },
-        }
-    raise ValueError("Not a StructuredTool or object with schema_")
-
-
-def _convert_parse_method_tool(lc_tool: Any) -> dict:
-    """Convert a tool object with a parse method."""
-    if hasattr(lc_tool, "parse") and callable(getattr(lc_tool, "parse")):
-        name = (
-            getattr(lc_tool, "name", None)
-            or getattr(lc_tool, "__class__", None).__name__
-        )
-        description = getattr(lc_tool, "__doc__", "") or f"Tool that parses {name}"
-        parameters_schema = {"type": "object", "properties": {}}
-        if hasattr(lc_tool, "schema"):
-            if callable(getattr(lc_tool, "schema")):
-                parameters_schema = lc_tool.schema()
-            elif isinstance(lc_tool.schema, dict):
-                parameters_schema = lc_tool.schema
-        return {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": parameters_schema,
-            },
-        }
-    raise ValueError("Not a parse-method tool")
-
-
-def _convert_route_schema_tool(lc_tool: Any) -> dict:
-    """Convert a RouteSchema special case tool."""
-    route_schema_names = ["RouteSchema", "route_schema"]
-    if hasattr(lc_tool, "name") and getattr(lc_tool, "name") in route_schema_names:
-        return {
-            "type": "function",
-            "function": {
-                "name": getattr(lc_tool, "name"),
-                "description": "Route to the next agent",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "next": {
-                            "type": "string",
-                            "enum": [
-                                "EmailAgent",
-                                "ScribeAgent",
-                                "TimeKeeperAgent",
-                                "GeneralAgent",
-                                "END",
-                                "__end__",
-                            ],
-                        }
-                    },
-                    "required": ["next"],
-                },
-            },
-        }
-    raise ValueError("Not a RouteSchema tool")
-
-
-def _create_minimal_tool(lc_tool: Any) -> dict:
-    """Fallback: create a minimal tool with empty schema."""
-    tool_type = type(lc_tool).__name__
-    name = str(getattr(lc_tool, "name", None) or tool_type)
-    description = str(getattr(lc_tool, "description", None) or "")
-    tool_repr = str(lc_tool)[:100] + "..." if len(str(lc_tool)) > 100 else str(lc_tool)
-    logger.error(
-        f"Could not convert tool to Llama API format: {tool_type} {tool_repr}. Creating fallback for {name}."
-    )
-    return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": description,
-            "parameters": {"type": "object", "properties": {}},
-        },
-    }
-
-
-def _lc_tool_to_llama_tool_param(lc_tool: Any) -> completion_create_params.Tool:
-    """Convert LangChain tool to Llama API format using a dispatcher pattern."""
-    converters = [
-        _convert_dict_tool,
-        _convert_pydantic_class_tool,
-        _convert_structured_tool,
-        _convert_parse_method_tool,
-        _convert_route_schema_tool,
-    ]
-    for converter in converters:
-        try:
-            return converter(lc_tool)
-        except Exception:
-            continue
-    return _create_minimal_tool(lc_tool)
-
-
-def _get_json_type_for_annotation(type_name: str) -> str:
-    """Helper to convert Python type annotations to JSON schema types."""
-    if type_name in ("str", "Text", "string"):
-        return "string"
-    elif type_name in ("int", "float", "complex", "number"):
-        return "number"
-    elif type_name in ("bool", "boolean"):
-        return "boolean"
-    elif type_name in ("list", "tuple", "array", "List", "Tuple"):
-        return "array"
-    elif type_name in ("dict", "Dict", "mapping", "Mapping"):
-        return "object"
-    else:
-        return "string"  # Default fallback
-
 
 # Valid models for the Llama API
 VALID_MODELS = {
@@ -433,8 +62,26 @@ VALID_MODELS = {
     "Llama-3.3-8B-Instruct",
 }
 
+LLAMA_KNOWN_MODELS = {
+    "Llama-3.3-70B-Instruct": {
+        "model_name": "Llama-3.3-70B-Instruct",
+    },
+    "Llama-3.3-8B-Instruct": {
+        "model_name": "Llama-3.3-8B-Instruct",
+    },
+    "Llama-4-Scout-17B-16E-Instruct-FP8": {  # Example, adjust as needed
+        "model_name": "Llama-4-Scout-17B-16E-Instruct-FP8",
+    },
+    "Llama-4-Maverick-17B-128E-Instruct-FP8": {  # Example, adjust as needed
+        "model_name": "Llama-4-Maverick-17B-128E-Instruct-FP8",
+    },
+}
 
-class ChatMetaLlama(BaseChatModel):
+LLAMA_DEFAULT_MODEL_NAME = "Llama-4-Maverick-17B-128E-Instruct-FP8"
+
+
+# STEEXZDdafsdfgasdfg
+class ChatMetaLlama(SyncChatMetaLlamaMixin, AsyncChatMetaLlamaMixin, BaseChatModel):
     """
     LangChain ChatModel wrapper for the native Meta Llama API using llama-api-client.
 
@@ -442,6 +89,7 @@ class ChatMetaLlama(BaseChatModel):
     - Supports tool calling (model-driven, no tool_choice parameter).
     - Handles message history and tool execution results.
     - Provides streaming and asynchronous generation.
+    - Fully compatible with LangSmith tracing and monitoring.
 
     Differences from OpenAI client:
     - No `tool_choice` parameter to force tool use.
@@ -453,7 +101,7 @@ class ChatMetaLlama(BaseChatModel):
     Example:
         ```python
         from llama_api_client import LlamaAPIClient
-        # from langchain_meta import ChatMetaLlama (assuming this class is in your_module.py)
+        from langchain_meta import ChatMetaLlama
 
         client = LlamaAPIClient(
             api_key=os.environ.get("META_API_KEY"),
@@ -462,26 +110,37 @@ class ChatMetaLlama(BaseChatModel):
         llm = ChatMetaLlama(client=client, model_name="Llama-4-Maverick-17B-128E-Instruct-FP8")
 
         # Basic invocation
-        # response = llm.invoke([HumanMessage(content="Hello Llama!")])
-        # print(response.content)
+        response = llm.invoke([HumanMessage(content="Hello Llama!")])
+        print(response.content)
 
         # Tool calling
-        # from langchain_core.tools import tool
-        # @tool
-        # def get_weather(location: str) -> str:
-        #     '''Gets the current weather in a given location.'''
-        #     return f"The weather in {location} is sunny."
-        #
-        # llm_with_tools = llm.bind_tools([get_weather])
-        # response = llm_with_tools.invoke("What is the weather in London?")
-        # print(response.tool_calls)
+        from langchain_core.tools import tool
+        @tool
+        def get_weather(location: str) -> str:
+            '''Gets the current weather in a given location.'''
+            return f"The weather in {location} is sunny."
+
+        llm_with_tools = llm.bind_tools([get_weather])
+        response = llm_with_tools.invoke("What is the weather in London?")
+        print(response.tool_calls)
+        ```
+
+    LangSmith integration:
+        To enable LangSmith tracing, set these environment variables:
+        ```
+        LANGSMITH_TRACING=true
+        LANGSMITH_API_KEY="your-api-key"
+        LANGSMITH_ENDPOINT="https://api.smith.langchain.com"
+        LANGSMITH_PROJECT="your-project-name"
         ```
     """
 
     _client: LlamaAPIClient | None = PrivateAttr(default=None)
-    model_name: str = Field(
-        default="Llama-4-Maverick-17B-128E-Instruct-FP8", alias="model"
-    )  # Added default
+    _async_client: AsyncLlamaAPIClient | None = PrivateAttr(default=None)
+
+    # Ensure Pydantic handles the default value if model_name is not provided.
+    # The field_validator can then focus on other forms of validation if needed.
+    model_name: Optional[str] = Field(default=LLAMA_DEFAULT_MODEL_NAME, alias="model")
 
     # Optional parameters for the Llama API, with LangChain common names where applicable
     temperature: Optional[float] = Field(default=None)  # Added default
@@ -491,21 +150,21 @@ class ChatMetaLlama(BaseChatModel):
     repetition_penalty: Optional[float] = Field(default=None)  # Added default
 
     # API Key and Base URL for client initialization if client is not passed
-    llama_api_key: Optional[str] = Field(default=None, alias="api_key")
-    llama_base_url: Optional[str] = Field(default=None, alias="base_url")
+    llama_api_key: Optional[SecretStr] = Field(default=None, alias="api_key")
+    llama_api_url: Optional[str] = Field(default=None, alias="base_url")
 
     SUPPORTED_PARAMS: ClassVar[set] = {
         "model",
         "messages",
         "temperature",
         "max_completion_tokens",
-        "stop",
         "tools",
         "stream",
         "repetition_penalty",
         "top_p",
         "top_k",
         "user",
+        "response_format",  # Added for structured output support
     }
 
     model_config = {
@@ -515,83 +174,88 @@ class ChatMetaLlama(BaseChatModel):
 
     def __init__(
         self,
-        *,  # Make all args keyword-only for clarity
-        model: Optional[str] = None,  # Alias for model_name
+        *,  # Make all args keyword-only
         model_name: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-        max_completion_tokens: Optional[int] = None,  # Alias for max_tokens
         repetition_penalty: Optional[float] = None,
-        api_key: Optional[str] = None,  # Alias for llama_api_key
         llama_api_key: Optional[str] = None,
-        base_url: Optional[str] = None,  # Alias for llama_base_url
-        llama_base_url: Optional[str] = None,
-        **kwargs: Any,  # For any other args BaseChatModel might take
-    ) -> None:
-        """Initialize the Llama API chat model."""
-        client = kwargs.pop("client", None)
-        self._client = client
-        # Ensure model_name is always set for Pydantic v2
-        if model_name is None and model is None:
-            model_name = "Llama-4-Maverick-17B-128E-Instruct-FP8"
-        super().__init__(
-            model=model,
-            model_name=model_name,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            max_completion_tokens=max_completion_tokens,
-            repetition_penalty=repetition_penalty,
-            api_key=api_key,
-            llama_api_key=llama_api_key,
-            base_url=base_url,
-            llama_base_url=llama_base_url,
-            **kwargs,
-        )
-        # Remove all post-init model_name logic; rely on Pydantic's default
-        # Keep the rest of the __init__ logic as is
-        resolved_api_key = llama_api_key
-        if api_key is not None:
-            resolved_api_key = api_key
-        if resolved_api_key is None:
-            resolved_api_key = None  # Explicit default from Field(default=None)
-        self.llama_api_key = resolved_api_key
-        resolved_base_url = llama_base_url
-        if base_url is not None:
-            resolved_base_url = base_url
-        if resolved_base_url is None:
-            resolved_base_url = None  # Explicit default from Field(default=None)
-        self.llama_base_url = resolved_base_url
-        resolved_temperature = temperature
-        if resolved_temperature is None:
-            resolved_temperature = None  # Explicit default from Field(default=None)
-        self.temperature = resolved_temperature
-        resolved_max_tokens = max_tokens
-        if max_completion_tokens is not None:
-            resolved_max_tokens = max_completion_tokens
-        if resolved_max_tokens is None:
-            resolved_max_tokens = None  # Explicit default from Field(default=None)
-        self.max_tokens = resolved_max_tokens
-        resolved_rep_penalty = repetition_penalty
-        if resolved_rep_penalty is None:
-            resolved_rep_penalty = None  # Explicit default from Field(default=None)
-        self.repetition_penalty = resolved_rep_penalty
-        if self._client is None and self.llama_api_key is not None:
-            self._ensure_client_initialized()
-
-    @validator("model_name")
-    def validate_model_name(cls, v):
-        """Validate that model_name is not empty and warn if not in known models."""
-        if not v:
-            raise ValueError("model_name cannot be empty")
-        if v not in VALID_MODELS:
-            model_list = ", ".join(VALID_MODELS)
-            warnings.warn(
-                f"Model '{v}' is not in the list of known Llama models.\n"
-                f"Known models: {model_list}\n"
-                f"Your model may still work if the Meta API accepts it, but hasn't been tested.",
-                stacklevel=2,
+        llama_api_url: Optional[str] = None,
+        client: Optional[LlamaAPIClient] = None,
+        async_client: Optional[AsyncLlamaAPIClient] = None,
+        **kwargs: Any,
+    ):
+        # If llama_api_key is not provided, try environment variables
+        if llama_api_key is None:
+            llama_api_key = os.environ.get("LLAMA_API_KEY") or os.environ.get(
+                "META_API_KEY"
             )
-        return v
+
+        init_values = {
+            "model_name": model_name,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "repetition_penalty": repetition_penalty,
+            "llama_api_key": llama_api_key,
+            "llama_api_url": llama_api_url,
+            **kwargs,  # Pydantic will handle client/async_client if passed as kwargs due to field defs
+        }
+
+        # Remove None values for fields where Pydantic should use its default
+        # or for fields that are truly optional and None is acceptable.
+        # For 'model_name', if it's None here, Pydantic will use its Field default.
+        init_values_filtered = {k: v for k, v in init_values.items() if v is not None}
+
+        # If model_name was explicitly passed as None, ensure it's not in filtered dict
+        # so pydantic uses the field's default. If it was not passed at all (not in kwargs),
+        # then it won't be in init_values_filtered either.
+        # If it was passed as a string, it will be in init_values_filtered.
+        if (
+            model_name is None and "model_name" in init_values_filtered
+        ):  # Should not happen if logic above is right
+            del init_values_filtered["model_name"]
+
+        super().__init__(**init_values_filtered)
+
+        # Assign explicitly passed clients to private attributes
+        # These are not Pydantic fields but are managed internally.
+        if client is not None:
+            self._client = client
+        if async_client is not None:
+            self._async_client = async_client
+
+        self._ensure_client_initialized()
+
+    @field_validator("model_name", mode="before")
+    @classmethod
+    def validate_model_name(
+        cls, v: Any, info: ValidationInfo
+    ):  # Changed FieldValidationInfo to ValidationInfo
+        # This validator now primarily ensures that if a model_name is provided, it's valid.
+        # The default is handled by Pydantic's Field definition.
+        if v is None:  # If None comes in (e.g. explicit model_name=None)
+            # Pydantic should have already applied the default from Field() if no value was passed.
+            # If v is None here, it means it was EXPLICITLY passed as None.
+            # In this case, we let Pydantic's default mechanism (from Field) take over,
+            # or if the field were truly Optional without a default, None would be fine.
+            # Given our Field has a default, this path implies we want that default.
+            # Returning None here will let Pydantic use the Field default.
+            return None  # Allow Pydantic to use Field's default
+
+        v_str = str(v).strip()
+        if not v_str:  # If it's an empty string after strip
+            # If an empty string was explicitly passed, fall back to default.
+            default_model = LLAMA_DEFAULT_MODEL_NAME  # Field default won't be used if empty str passed
+            logger.warning(f"model_name was empty. Defaulting to {default_model}")
+            return default_model
+
+        if v_str not in LLAMA_KNOWN_MODELS:
+            warnings.warn(
+                f"Model \\'{v_str}\\' is not in the list of known Llama models.\\n"
+                f"Known models: {', '.join(LLAMA_KNOWN_MODELS.keys())}\\n"
+                "Your model may still work if the Meta API accepts it, but hasn\\'t been tested."
+            )
+        return v_str
 
     @property
     def _llm_type(self) -> str:
@@ -615,38 +279,37 @@ class ChatMetaLlama(BaseChatModel):
         }
 
     def _ensure_client_initialized(self) -> None:
-        """Ensure that the client is initialized (synchronous by default)."""
-        if self._client is None:
-            current_api_key = self.llama_api_key
-            current_base_url = self.llama_base_url
-            if not isinstance(current_api_key, str) or not current_api_key:
-                env_api_key = os.environ.get("META_API_KEY")
-                if not env_api_key:
-                    raise ValueError(
-                        "META_API_KEY not found. Set it via environment variable or pass it directly to the constructor."
-                    )
-                self.llama_api_key = env_api_key
-                current_api_key = env_api_key
-            if not isinstance(current_base_url, str) or not current_base_url:
-                env_base_url = os.environ.get(
-                    "META_NATIVE_API_BASE_URL", "https://api.llama.com/v1/"
-                )
-                self.llama_base_url = env_base_url
-                current_base_url = env_base_url
-            try:
-                from llama_api_client import LlamaAPIClient
+        # Retrieve the plain string API key from the SecretStr field.
+        key_val = self.llama_api_key.get_secret_value() if self.llama_api_key else None
 
-                self._client = LlamaAPIClient(
-                    api_key=str(current_api_key),
-                    base_url=str(current_base_url),
+        # self.llama_api_url is a string field with a Pydantic default.
+        url_val = self.llama_api_url  # Corrected from llama_base_url
+
+        if self._client is None:
+            if not key_val:  # Check the actual string value of the key
+                # Log instead of raising, to match previous behavior pattern for missing optional clients
+                logger.warning(
+                    "LlamaAPIClient: API key is missing or empty. "
+                    "Sync client cannot be initialized."
                 )
-            except ImportError:
-                raise ImportError(
-                    "llama-api-client package not found, please install it with "
-                    "`pip install llama-api-client`"
+            else:
+                logger.debug("Instantiating LlamaAPIClient for ChatMetaLlama...")
+                self._client = LlamaAPIClient(api_key=key_val, base_url=url_val)
+                logger.info("LlamaAPIClient for ChatMetaLlama instantiated.")
+
+        if self._async_client is None:
+            if not key_val:  # Check the actual string value of the key
+                # Log instead of raising, to match previous behavior pattern for missing optional clients
+                logger.warning(
+                    "AsyncLlamaAPIClient: API key is missing or empty. "
+                    "Async client cannot be initialized."
                 )
-            except Exception as e:
-                raise ValueError(f"Failed to initialize LlamaAPIClient: {e}")
+            else:
+                logger.debug("Instantiating AsyncLlamaAPIClient for ChatMetaLlama...")
+                self._async_client = AsyncLlamaAPIClient(
+                    api_key=key_val, base_url=url_val
+                )
+                logger.info("AsyncLlamaAPIClient for ChatMetaLlama instantiated.")
 
     def _detect_supervisor_request(self, messages: List[BaseMessage]) -> bool:
         """Detect if this looks like a supervisor routing request.
@@ -664,48 +327,263 @@ class ChatMetaLlama(BaseChatModel):
                 return True
         return False
 
+<<<<<<< HEAD
     async def _agenerate(
         self,
         messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        tools: Optional[List[Union[Dict, Type[BaseModel], Callable, BaseTool]]] = None,
+        tool_choice: Optional[Union[dict, str, Literal["auto", "none", "any", "required"]]] = None,
         **kwargs: Any,
     ) -> ChatResult:
-        """Asynchronously call Llama API for chat completion."""
-        # Directly call the async _generate method
-        return await self._generate(messages, stop, run_manager, **kwargs)
+        """Asynchronously generates a chat response using AsyncLlamaAPIClient."""
+        self._ensure_client_initialized()
+        # We must use the async client from the initialized pair
+        if not self._async_client:
+            raise ValueError(
+                "Async client not initialized. Call `async_init_clients` first."
+            )
+        async_client_to_use = self._async_client
 
-    async def _generate(
+        # Start capturing for trace_info 
+        prompt_tokens = 0
+        completion_tokens = 0
+        
+        # Record start time for LangSmith duration tracking
+        start_time = datetime.now()
+        
+        # Combine tool_choice from direct param with kwargs if not already there
+        if tool_choice is not None and "tool_choice" not in kwargs:
+            kwargs["tool_choice"] = tool_choice
+        # If tools are provided directly, ensure they are in kwargs for _prepare_api_params
+        # Note: _prepare_api_params expects LC-formatted tools to be passed to its 'tools' param,
+        # not through **kwargs. So we will pass the 'tools' parameter directly.
+
+        if kwargs.get("stream", False):
+            # ... streaming logic ...
+            # Ensure to pass the directly provided 'tools' and 'tool_choice' to the streaming logic if it needs them
+            # For now, assuming streaming logic will also get them from kwargs or handle them
+            completion_coro = self._astream_with_aggregation_and_retries(
+                messages=messages, stop=stop, run_manager=run_manager, tools=tools, tool_choice=tool_choice, **kwargs
+            )
+            return await self._aget_stream_results(completion_coro, run_manager)
+        
+        # Non-streaming path
+        logger.debug(f"_agenerate received direct tools: {tools}")
+        logger.debug(f"_agenerate received direct tool_choice: {tool_choice}")
+        logger.debug(f"_agenerate received kwargs: {kwargs}")
+        
+        prepared_lc_tools: Optional[List[completion_create_params.Tool]] = None
+        if tools: # Use the 'tools' parameter passed to this method
+            prepared_lc_tools = [_lc_tool_to_llama_tool_param(tool) for tool in tools]
+            logger.debug(f"_agenerate prepared_lc_tools from direct param: {prepared_lc_tools}")
+        else:
+            logger.debug("_agenerate: No direct tools parameter provided.")
+            
+        api_params = self._prepare_api_params(
+            messages, tools=prepared_lc_tools, **kwargs # Pass prepared_lc_tools, tool_choice is in kwargs
+        )
+
+        if run_manager:
+            # Estimate token count for LangSmith
+            input_tokens = self._count_tokens(messages)
+            try:
+                # Use the correct callback method for AsyncCallbackManagerForLLMRun
+                llm_data = {"name": self.__class__.__name__}
+                invocation_params = self._get_invocation_params(**kwargs)
+                options = {"model_name": self.model_name}
+                
+                # For async CallbackManager
+                if hasattr(run_manager, "on_llm_start"):
+                    await run_manager.on_llm_start(llm_data, messages, invocation_params=invocation_params, options=options)
+                # Fallback for other callback managers
+                elif hasattr(run_manager, "aon_llm_start"):
+                    await run_manager.aon_llm_start(llm_data, messages, invocation_params=invocation_params, options=options)
+                # Try sync method as last resort
+                elif hasattr(run_manager, "on_llm_start"):
+                    run_manager.on_llm_start(llm_data, messages, invocation_params=invocation_params, options=options)
+                else:
+                    logger.debug("No compatible callback method found on run_manager.")
+            except (AttributeError, TypeError):
+                # Handle case where run_manager doesn't have on_llm_start method
+                try:
+                    run_manager.on_llm_start(
+                        {"name": self.__class__.__name__},
+                        messages, 
+                        invocation_params=self._get_invocation_params(**kwargs),
+                        options={"model_name": self.model_name}
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to use run_manager callbacks: {str(e)}")
+                    
+        logger.debug(f"Llama API (async) Request (ainvoke): {api_params}")
+        try:
+            call_result: CreateChatCompletionResponse = (
+                await async_client_to_use.chat.completions.create(**api_params) 
+            )
+            logger.debug(f"Llama API (async) Response (ainvoke): {call_result}")
+        except Exception as e:
+            # Handle errors and attach to RunManager if available
+            if run_manager:
+                try:
+                    await run_manager.on_llm_error(
+                        error=e,
+                    )
+                except Exception as callback_err:
+                    logger.warning(f"Error in LangSmith error callback: {callback_err}")
+            # Re-raise the original error
+            raise e
+            
+        # Get the raw response message from the completion message
+        result_msg = call_result.completion_message
+        
+        # Parse content which might be a dict or string
+        content_str = ""
+        if result_msg:
+            if hasattr(result_msg, "content"):
+                content = getattr(result_msg, "content")
+                if isinstance(content, dict) and "text" in content:
+                    content_str = content["text"]
+                elif isinstance(content, str):
+                    content_str = content
+                
+        # Generate metadata for tool calls if present
+        tool_calls_data: Optional[List[Dict]] = None
+        if hasattr(result_msg, "tool_calls") and result_msg.tool_calls:
+            tool_calls_data = []
+            for idx, tc in enumerate(result_msg.tool_calls):
+                tc_id = getattr(tc, "id", f"llama_tc_{idx}")
+                tc_func = tc.function if hasattr(tc, "function") else None
+                tc_name = getattr(tc_func, "name", None) if tc_func else None
+                tc_args_str = getattr(tc_func, "arguments", "") if tc_func else ""
+                
+                # Make sure tool names are strings, not MagicMock objects
+                if tc_name and not isinstance(tc_name, str):
+                    if hasattr(tc_name, "__str__"):
+                        tc_name = str(tc_name)
+                    else:
+                        tc_name = "unknown_tool"
+                
+                try:
+                    parsed_args = json.loads(tc_args_str) if tc_args_str else {}
+                except json.JSONDecodeError:
+                    # If arguments is not valid JSON, use it as a string
+                    parsed_args = tc_args_str
+                
+                tool_calls_data.append({
+                    "id": tc_id,
+                    "type": "function",
+                    "name": tc_name or "",
+                    "args": parsed_args,
+                })
+        
+        # Create the message to return
+        message = AIMessage(
+            content=content_str if content_str else "",
+            tool_calls=tool_calls_data,
+        )
+        
+        # Add message metadata and generation info
+        generation_info = {}
+        
+        # Add finish reason
+        if hasattr(result_msg, "stop_reason") and result_msg.stop_reason:
+            generation_info["finish_reason"] = result_msg.stop_reason
+        elif hasattr(call_result, "stop_reason") and call_result.stop_reason:
+            generation_info["finish_reason"] = call_result.stop_reason
+        
+        # Process usage from metrics if present
+        if hasattr(call_result, 'metrics') and call_result.metrics and isinstance(call_result.metrics, list):
+            usage_meta = {}
+            for metric_item in call_result.metrics:
+                if hasattr(metric_item, 'metric') and hasattr(metric_item, 'value'):
+                    metric_name = getattr(metric_item, 'metric') # Use getattr for safety
+                    metric_value = getattr(metric_item, 'value')
+                    if metric_name == "num_prompt_tokens":
+                        usage_meta["input_tokens"] = metric_value
+                        prompt_tokens = metric_value
+                    elif metric_name == "num_completion_tokens":
+                        usage_meta["output_tokens"] = metric_value
+                        completion_tokens = metric_value
+                    elif metric_name == "num_total_tokens":
+                        usage_meta["total_tokens"] = metric_value
+            if usage_meta:
+                generation_info["usage_metadata"] = usage_meta
+                message.usage_metadata = usage_meta
+        elif hasattr(call_result, 'usage') and call_result.usage: # Fallback for a direct .usage attribute
+            usage_data = call_result.usage
+            usage_meta = {
+                "input_tokens": getattr(usage_data, 'prompt_tokens', 0),
+                "output_tokens": getattr(usage_data, 'completion_tokens', 0),
+                "total_tokens": getattr(usage_data, 'total_tokens', 0),
+            }
+            prompt_tokens = usage_meta["input_tokens"]
+            completion_tokens = usage_meta["output_tokens"]
+            if any(usage_meta.values()): # Only add if some values are non-zero
+                generation_info["usage_metadata"] = usage_meta
+                message.usage_metadata = usage_meta
+
+        if hasattr(call_result, 'x_request_id') and call_result.x_request_id:
+            generation_info["x_request_id"] = call_result.x_request_id
+        
+        generation_info["response_metadata"] = call_result.to_dict()
+        
+        # Calculate duration for LangSmith
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        generation_info["duration"] = duration
+
+        # Create the result
+        result = ChatResult(generations=[ChatGeneration(message=message, generation_info=generation_info)])
+        
+        # Report to run_manager for LangSmith tracing
+        if run_manager:
+            token_usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
+            }
+            
+            trace_info = {
+                "model_name": self.model_name,
+                "token_usage": token_usage,
+                "system_fingerprint": getattr(call_result, "system_fingerprint", None),
+                "request_id": getattr(call_result, "x_request_id", None),
+                "duration": duration,
+                "model_id": getattr(call_result, "model", self.model_name),
+            }
+            
+            await run_manager.on_llm_end(
+                result, 
+                token_usage=token_usage, 
+                trace_info=trace_info
+            )
+            
+        return result
+
+    async def _astream(
         self,
         messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
-        run_manager: Optional[
-            AsyncCallbackManagerForLLMRun | CallbackManagerForLLMRun
-        ] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
-    ) -> ChatResult:
-        """Main method for Llama API chat completion call (now async)."""
-        if stop:
-            if run_manager:
-                await run_manager.on_text(
-                    "Warning: 'stop' sequences are not directly supported by the Llama API client and will be ignored.\n",
-                    color="yellow",
-                )
-            if "stop_sequences" not in kwargs:
-                kwargs["stop_sequences"] = stop
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        """Asynchronously streams chat responses using AsyncLlamaAPIClient."""
+        self._ensure_client_initialized()
+        if self._async_client is None:
+            raise ValueError("AsyncLlamaAPIClient not initialized.")
 
-        if "tool_choice" in kwargs:
-            if run_manager:
-                await run_manager.on_text(
-                    "Warning: 'tool_choice' parameter is not supported by the Meta Llama API and will be ignored.\n",
-                    color="yellow",
-                )
-            kwargs.pop("tool_choice")
+        active_async_client = kwargs.get("async_client") or self._async_client
+        if not active_async_client:
+             raise ValueError("Could not obtain an active AsyncLlamaAPIClient.")
 
-        if self._detect_supervisor_request(messages) and "stream" not in kwargs:
-            logger.debug("Forcing stream=False for supervisor request in _generate")
-            kwargs["stream"] = False
+        tools = kwargs.get("tools")
+        prepared_tools: Optional[List[completion_create_params.Tool]] = None
+        if tools:
+            prepared_tools = [_lc_tool_to_llama_tool_param(tool) for tool in tools]
 
+<<<<<<< HEAD
         llama_messages: List[MessageParam] = [
             _lc_message_to_llama_message_param(m) for m in messages
         ]
@@ -748,7 +626,13 @@ class ChatMetaLlama(BaseChatModel):
             # Call the API but handle both awaitable and non-awaitable responses
             call_result = active_client.chat.completions.create(**api_params)
             # Check if the result is awaitable or already a response
+<<<<<<< HEAD
+            if hasattr(call_result, "__await__") and callable(
+                getattr(call_result, "__await__")
+            ):
+=======
             if hasattr(call_result, "__await__") and callable(getattr(call_result, "__await__")):
+>>>>>>> 61e5ab2 (fixed it woo)
                 # It's an awaitable, so await it
                 response_obj = await call_result
             else:
@@ -882,580 +766,518 @@ class ChatMetaLlama(BaseChatModel):
                 message=AIMessage(**ai_message_kwargs),
                 generation_info=generation_info,
             )
+=======
+        api_params = self._prepare_api_params(
+            messages, tools=prepared_tools, stop=stop, stream=True, **kwargs
+>>>>>>> e4c0f84 (ai is insane)
+        )
+        
+        logger.debug(f"Llama API (async) Request (astream): {api_params}")
+        
+        async for chunk_part in await active_async_client.chat.completions.create(**api_params): 
+            logger.debug(f"Llama API (async) Stream Chunk: {chunk_part.to_dict()}")
+            
+            # The Meta API streaming format is different from OpenAI's
+            # Instead of a delta attribute, it provides content directly
+            chunk_dict = chunk_part.to_dict()
+            
+            # Extract content string
+            content_str = ""
+            if hasattr(chunk_part, "completion_message") and chunk_part.completion_message:
+                if hasattr(chunk_part.completion_message, "content") and chunk_part.completion_message.content:
+                    content_str = chunk_part.completion_message.content
+            
+            # Build generation info
+            generation_info = {}
+            if hasattr(chunk_part, "stop_reason") and chunk_part.stop_reason:
+                generation_info["finish_reason"] = chunk_part.stop_reason
+            elif hasattr(chunk_part, "finish_reason") and chunk_part.finish_reason:
+                generation_info["finish_reason"] = chunk_part.finish_reason
+            
+            # Add response metadata
+            if chunk_dict.get("x_request_id"):
+                generation_info["x_request_id"] = chunk_dict.get("x_request_id")
+            if hasattr(chunk_part, "usage") and chunk_part.usage:
+                generation_info["chunk_usage"] = chunk_part.usage.to_dict()
+
+            # Handle tool calls if present
+            chunk_tool_calls = []
+            if hasattr(chunk_part, "completion_message") and chunk_part.completion_message and \
+               hasattr(chunk_part.completion_message, "tool_calls") and chunk_part.completion_message.tool_calls:
+                for idx, tc in enumerate(chunk_part.completion_message.tool_calls):
+                    # Handle Meta's specific tool call format for streaming
+                    tool_call_data = {
+                        "id": getattr(tc, "id", f"tc_{idx}"),
+                        "type": "function",
+                        "name": getattr(tc.function, "name", None) if hasattr(tc, "function") else None,
+                        "args": getattr(tc.function, "arguments", "") if hasattr(tc, "function") else "",
+                        "index": idx
+                    }
+                    chunk_tool_calls.append(tool_call_data)
+            
+            # Create and yield the chunk
+            chunk = ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content=content_str or "",
+                    tool_call_chunks=chunk_tool_calls if chunk_tool_calls else [],
+                ),
+                generation_info=generation_info if generation_info else None,
+            )
+            if run_manager:
+                await run_manager.on_llm_new_token(chunk.text, chunk=chunk)
+            yield chunk
+
+    async def _astream_with_aggregation_and_retries(
+        self,
+        messages: List[BaseMessage],
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        """Wraps _astream with retry logic and aggregates final AIMessageChunk state."""
+        # Note: Retry logic for async streams is complex and not fully implemented here.
+        # llama_api_client might handle retries internally. This focuses on aggregation.
+        
+        final_content = ""
+        aggregated_tool_call_chunks: List[Dict[str, Any]] = [] # Stores List[ToolCallChunk] compatible dicts
+        
+        # More robust tool call aggregation:
+        # We need to aggregate args for the same tool_call id and index.
+        # LangChain's AIMessageChunk expects tool_call_chunks with potentially partial 'args'.
+        # The final AIMessage in _agenerate (streaming path) needs fully formed tool_calls.
+        
+        # Temporarily store tool call deltas by index to reconstruct them
+        tool_deltas_by_index: Dict[int, Dict[str, Any]] = {}
+
+        final_generation_info = {} # To accumulate finish_reason, usage, etc.
+
+        async for chunk in self._astream(messages=messages, **kwargs): # This calls the newly refactored _astream
+            final_content += chunk.text # Aggregate content
+            
+            if chunk.generation_info:
+                # Accumulate relevant generation_info like finish_reason
+                # Be careful not to overwrite if multiple chunks provide it (e.g. take last)
+                final_generation_info.update(chunk.generation_info)
+
+
+            current_chunk_tool_calls = []
+            if chunk.message and chunk.message.tool_call_chunks:
+                for tc_chunk_data in chunk.message.tool_call_chunks:
+                    # tc_chunk_data is already in LangChain's ToolCallChunk format (dict)
+                    # {'id': str, 'name': Optional[str], 'args': str (delta), 'index': int}
+                    current_chunk_tool_calls.append(tc_chunk_data) # Keep as is for yielding
+
+                    # For aggregation into final_tool_calls for _agenerate's streaming path
+                    idx = tc_chunk_data.get("index")
+                    if idx is not None:
+                        if idx not in tool_deltas_by_index:
+                            tool_deltas_by_index[idx] = {
+                                "id": tc_chunk_data.get("id"),
+                                "name": tc_chunk_data.get("name"),
+                                "args": "", 
+                                "type": tc_chunk_data.get("type", "function"),
+                                "index": idx
+                            }
+                        if tc_chunk_data.get("name") and tool_deltas_by_index[idx].get("name") is None:
+                             tool_deltas_by_index[idx]["name"] = tc_chunk_data.get("name")
+                        if tc_chunk_data.get("id") and tool_deltas_by_index[idx].get("id") is None:
+                             tool_deltas_by_index[idx]["id"] = tc_chunk_data.get("id")
+                        args_delta = tc_chunk_data.get("args")
+                        if isinstance(args_delta, str):
+                            tool_deltas_by_index[idx]["args"] += args_delta
+            
+            # Aggregate tool calls
+            final_aggregated_tool_calls_for_aimessage = []
+            for agg_tc in current_chunk_tool_calls:
+                final_aggregated_tool_calls_for_aimessage.append({
+                    "id": agg_tc.get("id"),
+                    "type": agg_tc.get("type", "function"),
+                    "name": agg_tc.get("name"),
+                    "args": agg_tc.get("args"),
+                    "index": agg_tc.get("index")
+                })
+            
+            # Create and yield the chunk
+            chunk = ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content=final_content,
+                    tool_call_chunks=final_aggregated_tool_calls_for_aimessage,
+                ),
+                generation_info=final_generation_info,
+            )
+            if run_manager:
+                await run_manager.on_llm_new_token(chunk.text, chunk=chunk)
+            yield chunk
+
+            # Update final_content and final_generation_info
+            final_content = ""
+            final_generation_info = {}
+            
+            # Update tool_deltas_by_index for next iteration
+            tool_deltas_by_index = {}
+
+        # Final aggregation
+        final_aggregated_tool_calls_for_aimessage = []
+        for agg_tc in final_aggregated_tool_calls_for_aimessage:
+            final_aggregated_tool_calls_for_aimessage.append({
+                "id": agg_tc.get("id"),
+                "type": agg_tc.get("type", "function"),
+                "name": agg_tc.get("name"),
+                "args": agg_tc.get("args"),
+                "index": agg_tc.get("index")
+            })
+        
+        # Create and yield the final chunk
+        final_chunk = ChatGenerationChunk(
+            message=AIMessageChunk(
+                content=final_content,
+                tool_call_chunks=final_aggregated_tool_calls_for_aimessage,
+            ),
+            generation_info=final_generation_info,
+        )
+        if run_manager:
+            await run_manager.on_llm_new_token(final_chunk.text, chunk=final_chunk)
+        yield final_chunk
+
+    async def _aget_stream_results(
+        self,
+        completion_coro: AsyncIterator[ChatGenerationChunk],
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+    ) -> ChatResult:
+        """Aggregates results from a stream of ChatGenerationChunks."""
+        final_content = ""
+        final_tool_calls = []
+        final_generation_info = {}
+
+        async for chunk in completion_coro:
+            final_content += chunk.text
+            if chunk.generation_info:
+                final_generation_info.update(chunk.generation_info)
+            if chunk.message and chunk.message.tool_call_chunks:
+                final_tool_calls.extend(chunk.message.tool_call_chunks)
+
+        final_generation_info["finish_reason"] = chunk.generation_info["finish_reason"] if chunk.generation_info else "stop"
+        final_generation_info["duration"] = chunk.generation_info["duration"] if chunk.generation_info else 0
+
+        final_message = AIMessage(
+            content=final_content,
+            tool_calls=final_tool_calls,
         )
 
-        llm_output = {"metrics": response_obj.metrics} if response_obj.metrics else {}
-        return ChatResult(generations=generations, llm_output=llm_output)
-
-    def bind(self, **kwargs: Any) -> Any:
-        """Override bind to handle tool_choice correctly for Meta compatibility."""
-        # This method intercepts the bind operation to handle tool_choice before it gets stored
-        # in the bound object, ensuring it works as a drop-in replacement for ChatOpenAI
-        logger.debug(f"bind called with kwargs: {kwargs}")
-
-        # Store the fact that we have bound tools to be used later
-        if "tools" in kwargs:
-            logger.debug(f"Tools were bound: {kwargs['tools']}")
-            # We keep tools as is - they'll be extracted in _generate, _agenerate, etc.
-
-        # If tool_choice is present, log it but don't prevent the binding
-        # The actual filtering will happen in _generate, _agenerate, etc.
-        if "tool_choice" in kwargs:
-            logger.debug(
-                f"Detected tool_choice in bind: {kwargs['tool_choice']}. "
-                f"Will be ignored during API calls to Meta's API."
-            )
-
-            # If it's "none", we need to remove tools or they'll be used anyway by Llama
-            if kwargs.get("tool_choice") == "none":
-                # For OpenAI compatibility, tool_choice="none" means never use tools
-                logger.debug("tool_choice is 'none', removing tools from kwargs")
-                kwargs.pop("tools", None)
-            elif (
-                isinstance(kwargs.get("tool_choice"), dict)
-                and kwargs.get("tool_choice", {}).get("type") == "function"
-            ):
-                # If tool_choice is forcing a specific function, make sure that tool is included
-                # This is just for ensuring compatibility, as Llama API doesn't support forcing function use
-                # But we want the bound LLM to at least have the tools available for use
-                forced_tool_name = (
-                    kwargs.get("tool_choice", {}).get("function", {}).get("name")
-                )
-                if forced_tool_name and "tools" in kwargs:
-                    logger.debug(
-                        f"Tool choice is forcing function '{forced_tool_name}', making sure it's available"
-                    )
-                    # We don't need to do anything special for Meta, as it will decide when to use tools
-                    # but we log that we've detected this usage pattern
-
-            # Don't actually modify tool_choice in kwargs - we'll handle it in the API call methods
-
-        # Let the parent class handle the actual binding
-        return super().bind(**kwargs)
-
-    def with_structured_output(self, schema, *, include_raw: bool = False, **kwargs):
-        """
-        Creates a structured output wrapper for the Meta Llama API.
-
-        Args:
-            schema: The Pydantic schema to use for output parsing
-            include_raw: Whether to include raw LLM output (not supported)
-            **kwargs: Additional kwargs to pass to the LLM
-
-        Returns:
-            A wrapper around the LLM that outputs structured objects
-        """
-        # Adding explicit logging for debugging
-        logger.debug(f"Using model_json_schema() method")
-
-        # Import here to avoid circular imports
-        from langchain_core.runnables import Runnable
-        from langchain_core.pydantic_v1 import create_model, BaseModel
-        from langchain_core.messages import SystemMessage, HumanMessage
-
-        # Verify we have a valid schema class
-        if hasattr(schema, "model_json_schema") and callable(
-            getattr(schema, "model_json_schema")
-        ):
-            schema_dict = schema.model_json_schema()
-            schema_name = (
-                schema.__name__ if hasattr(schema, "__name__") else str(schema)
-            )
-        elif hasattr(schema, "schema") and callable(getattr(schema, "schema")):
-            schema_dict = schema.schema()
-            schema_name = (
-                schema.__name__ if hasattr(schema, "__name__") else str(schema)
-            )
-        else:
-            schema_dict = schema
-            schema_name = "CustomSchema"
-
-        logger.debug(
-            f"Created Meta-specific structured output wrapper for schema: {schema_name}"
+        final_result = ChatResult(
+            generations=[ChatGeneration(message=final_message, generation_info=final_generation_info)]
         )
 
-        # Bind streaming off explicitly for structured output
-        kwargs["stream"] = False
-        bound_llm = self.bind(**kwargs)
-        logger.debug(f"bind called with kwargs: {kwargs}")
-
-        class MetaStructuredOutputWrapper(Runnable):
-            """Wrapper for Meta Llama models that handles structured output."""
-
-            def __init__(self, base_llm):
-                self.base_llm = base_llm
-                self.schema = schema
-                self.schema_dict = schema_dict
-                self.schema_name = schema_name
-
-            def _filter_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
-                """
-                Filter out LangChain-specific parameters that should not be passed to the Meta API.
-
-                Args:
-                    params: Dictionary of parameters to filter
-
-                Returns:
-                    Filtered dictionary with API-compatible parameters
-                """
-                # LangChain-specific parameters that should not be passed to the API
-                langchain_params = {
-                    "tags",
-                    "metadata",
-                    "callbacks",
-                    "run_managers",
-                    "recursion_limit",
-                    "tags_keys",
-                    "id_key",
-                }
-
-                return {k: v for k, v in params.items() if k not in langchain_params}
-
-            def _fix_response_format(self, content):
-                """Extract valid JSON from response content."""
-                if not content:
-                    return {"error": "Empty response from LLM"}
-
-                # First try direct JSON parsing
-                if isinstance(content, str):
-                    content = content.strip()
-                    try:
-                        return json.loads(content)
-                    except json.JSONDecodeError:
-                        pass
-
-                    # Try to find JSON in code blocks
-                    json_match = re.search(
-                        r"```(?:json)?\s*([\s\S]*?)\s*```", content, re.DOTALL
-                    )
-                    if json_match:
-                        try:
-                            return json.loads(json_match.group(1).strip())
-                        except json.JSONDecodeError:
-                            pass
-
-                    # Try to find JSON object pattern
-                    obj_match = re.search(r"({[\s\S]*})", content, re.DOTALL)
-                    if obj_match:
-                        try:
-                            return json.loads(obj_match.group(1).strip())
-                        except json.JSONDecodeError:
-                            pass
-
-                # If all parsing attempts fail, return the original content
-                logger.warning(f"Could not parse response as JSON: {content[:100]}...")
-                return content
-
-            def _add_schema_instruction(self, messages):
-                """Add JSON schema instruction to messages."""
-                from langchain_core.messages import SystemMessage, HumanMessage
-                from langchain_core.prompt_values import ChatPromptValue
-
-                schema_instruction = (
-                    f"You MUST respond with a valid JSON object that matches this schema:\n"
-                    f"{json.dumps(self.schema_dict, indent=2)}\n\n"
-                    f"Do not include explanations, only output valid JSON that matches the schema."
-                )
-
-                # Handle ChatPromptValue objects (returned by prompt templates)
-                if hasattr(messages, "to_messages") and callable(messages.to_messages):
-                    # Extract the actual messages
-                    message_list = messages.to_messages()
-                    has_system = any(
-                        isinstance(msg, SystemMessage) for msg in message_list
-                    )
-
-                    # Create a new list with schema instruction
-                    if has_system:
-                        # Add to existing system message
-                        new_messages = []
-                        for msg in message_list:
-                            if isinstance(msg, SystemMessage):
-                                # Update the first system message we find
-                                new_content = f"{msg.content}\n\n{schema_instruction}"
-                                new_messages.append(SystemMessage(content=new_content))
-                            else:
-                                new_messages.append(msg)
-                    else:
-                        # Add a new system message at the beginning
-                        new_messages = [
-                            SystemMessage(content=schema_instruction)
-                        ] + message_list
-
-                    return new_messages
-
-                # Handle regular message lists
-                elif isinstance(messages, list):
-                    for i, msg in enumerate(messages):
-                        if isinstance(msg, SystemMessage):
-                            # Add schema instruction to existing system message
-                            updated_content = f"{msg.content}\n\n{schema_instruction}"
-                            messages[i] = SystemMessage(content=updated_content)
-                            return messages
-
-                    # No system message found, add one at the beginning
-                    return [SystemMessage(content=schema_instruction)] + messages
-
-                # Handle anything else by converting to a list of messages
-                else:
-                    # Try to convert to a string if possible
-                    content = str(messages)
-                    # Create a new list with system message and human message
-                    return [
-                        SystemMessage(content=schema_instruction),
-                        HumanMessage(content=content),
-                    ]
-
-            def invoke(self, input_data, config=None, **kwargs):
-                """Sync invoke: calls async ainvoke under the hood."""
-                return asyncio.run(self.ainvoke(input_data, config, **kwargs))
-
-            async def ainvoke(self, input_data, config=None, **invoke_kwargs):
-                """Process messages asynchronously and return JSON conforming to the schema."""
-                messages = input_data
-
-                # Handle various input types
-                if isinstance(input_data, dict) and "input" in input_data:
-                    # Handle dict with 'input' key (common in RunnableSequence)
-                    user_input = input_data["input"]
-                    if isinstance(user_input, str):
-                        messages = [HumanMessage(content=user_input)]
-                    elif isinstance(user_input, list):
-                        messages = user_input
-                    else:
-                        messages = [HumanMessage(content=str(user_input))]
-                elif isinstance(input_data, str):
-                    # Handle plain string input as a human message
-                    messages = [HumanMessage(content=input_data)]
-
-                # Merge config and kwargs
-                kwargs = {}
-                if config:
-                    if isinstance(config, dict):
-                        kwargs.update(config)
-
-                # Add invoke_kwargs, but don't override config values with None
-                for k, v in invoke_kwargs.items():
-                    if k not in kwargs or v is not None:
-                        kwargs[k] = v
-
-                # Filter out LangChain-specific parameters
-                kwargs = self._filter_params(kwargs)
-
-                # Add JSON schema instruction
-                enhanced_messages = self._add_schema_instruction(messages)
-
-                # Call the LLM asynchronously
-                result = await self.base_llm.ainvoke(enhanced_messages, **kwargs)
-
-                # Get the content string
-                if hasattr(result, "content"):
-                    content = result.content
-                else:
-                    content = str(result)
-
-                # Parse JSON response
-                return self._fix_response_format(content)
-
-            def stream(self, input_data, config=None, **stream_kwargs):
-                """Sync stream: calls async astream under the hood."""
-
-                async def _stream():
-                    async for chunk in self.astream(
-                        input_data, config, **stream_kwargs
-                    ):
-                        yield chunk
-
-                return _stream()
-
-            async def astream(self, input_data, config=None, **stream_kwargs):
-                """We don't support streaming for structured output.
-                Just do a regular ainvoke and yield a single chunk."""
-                from langchain_core.messages import AIMessageChunk
-                from langchain_core.outputs import ChatGenerationChunk
-
-                # Merge config and kwargs
-                kwargs = {}
-                if config:
-                    if isinstance(config, dict):
-                        kwargs.update(config)
-
-                # Add stream_kwargs, but don't override config values with None
-                for k, v in stream_kwargs.items():
-                    if k not in kwargs or v is not None:
-                        kwargs[k] = v
-
-                # Filter out LangChain-specific parameters
-                kwargs = self._filter_params(kwargs)
-
-                result = await self.ainvoke(input_data, **kwargs)
-                if isinstance(result, str):
-                    yield ChatGenerationChunk(message=AIMessageChunk(content=result))
-                else:
-                    yield ChatGenerationChunk(
-                        message=AIMessageChunk(content=json.dumps(result))
-                    )
-
-            def bind(self, **binding_kwargs):
-                """Create a new instance with updated kwargs."""
-                if binding_kwargs:
-                    # LangChain-specific parameters that should not be passed to the API
-                    # but should be handled by the LangChain wrapper logic
-                    langchain_params = {
-                        "tags",
-                        "metadata",
-                        "callbacks",
-                        "run_managers",
-                        "recursion_limit",
-                        "tags_keys",
-                        "id_key",
-                    }
-
-                    # Only pass API-relevant parameters to the base LLM
-                    base_llm_kwargs = {
-                        k: v
-                        for k, v in binding_kwargs.items()
-                        if k not in langchain_params
-                    }
-
-                    new_base_llm = self.base_llm.bind(**base_llm_kwargs)
-                    return MetaStructuredOutputWrapper(new_base_llm)
-                return self
-
-        # Return the wrapper
-        return MetaStructuredOutputWrapper(bound_llm)
-
-    def bind_tools(self, tools, **kwargs):
-        """Bind tools to the LLM in a Meta API compatible way."""
-        logger.debug(f"bind_tools called with {len(tools)} tools")
-
-        # Handle any tool_choice that might be in kwargs
-        if "tool_choice" in kwargs:
-            logger.debug(
-                f"bind_tools: detected tool_choice: {kwargs['tool_choice']}. "
-                f"This will be ignored during API calls to Meta."
-            )
-
-            # If it's "none", we need to remove tools or they'll be used anyway by Llama
-            if kwargs.get("tool_choice") == "none":
-                # For OpenAI compatibility, tool_choice="none" means never use tools
-                logger.debug("tool_choice is 'none', not binding any tools")
-                return self.bind(**kwargs)  # Bind without tools
-
-        # For Meta API, we just need to bind the tools, tool_choice is not supported
-        return self.bind(tools=tools, **kwargs)
-
-    # Consider adding a method to check for Llama Guard moderation if needed,
-    # or integrating it if the API supports it as part of the chat completion.
-    # The Llama API docs show a separate /moderations endpoint.
-
-    def _clean_schema_for_meta(self, schema: dict) -> dict:
-        """Clean JSON schema for Meta API compatibility.
-
-        Meta's API only supports a very limited subset of JSON Schema properties:
-        - Common: "title", "type", "description"
-        - Arrays: "items" (plus the common ones)
-        - Objects: "properties", "required" (plus the common ones)
-
-        Everything else must be removed, including all validation properties.
-
-        Returns a cleaned copy of the schema with only supported properties.
-        """
-        if not isinstance(schema, dict):
-            return schema
-
-        # Whitelist approach: Only keep explicitly supported properties
-        cleaned = {}
-
-        # Common supported properties for all types
-        SUPPORTED_COMMON = {"title", "type", "description"}
-
-        # Additional supported properties by schema type
-        schema_type = schema.get("type", "")
-
-        if schema_type == "object":
-            # For objects, also support properties and required
-            SUPPORTED_ADDITIONAL = {"properties", "required", "additionalProperties"}
-
-            # Handle nested objects in properties
-            if "properties" in schema:
-                cleaned_props = {}
-                for prop_name, prop_schema in schema.get("properties", {}).items():
-                    cleaned_props[prop_name] = self._clean_schema_for_meta(prop_schema)
-                cleaned["properties"] = cleaned_props
-
-            # Keep the required property as is
-            if "required" in schema:
-                cleaned["required"] = schema["required"]
-
-            # Handle additionalProperties if present
-            if "additionalProperties" in schema:
-                if isinstance(schema["additionalProperties"], dict):
-                    cleaned["additionalProperties"] = self._clean_schema_for_meta(
-                        schema["additionalProperties"]
-                    )
-                else:
-                    cleaned["additionalProperties"] = schema["additionalProperties"]
-
-        elif schema_type == "array":
-            # For arrays, also support items
-            SUPPORTED_ADDITIONAL = {"items"}
-
-            # Clean the items schema
-            if "items" in schema:
-                if isinstance(schema["items"], dict):
-                    cleaned["items"] = self._clean_schema_for_meta(schema["items"])
-                elif isinstance(schema["items"], list):
-                    cleaned["items"] = [
-                        (
-                            self._clean_schema_for_meta(item)
-                            if isinstance(item, dict)
-                            else item
-                        )
-                        for item in schema["items"]
-                    ]
-                else:
-                    cleaned["items"] = schema["items"]
-
-        elif "anyOf" in schema:
-            # For anyOf types, we need special handling
-            SUPPORTED_ADDITIONAL = {"anyOf"}
-
-            if "anyOf" in schema:
-                cleaned["anyOf"] = [
-                    (
-                        self._clean_schema_for_meta(option)
-                        if isinstance(option, dict)
-                        else option
-                    )
-                    for option in schema["anyOf"]
-                ]
-        else:
-            # For primitive types, no additional properties
-            SUPPORTED_ADDITIONAL = set()
-
-        # Copy common supported properties
-        for key in SUPPORTED_COMMON:
-            if key in schema:
-                cleaned[key] = schema[key]
-
-        # Copy type-specific supported properties that weren't already handled
-        for key in SUPPORTED_ADDITIONAL:
-            if key in schema and key not in cleaned:
-                cleaned[key] = schema[key]
-
-        return cleaned
-
-    def _filter_unsupported_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Filter parameters to only include those supported by the Meta LLM API.
-        Uses a whitelist approach instead of a blacklist.
-
-        Args:
-            params: Dictionary of parameters to filter
-        Returns:
-            Filtered dictionary with only supported parameters
-        """
-        return {
-            key: value for key, value in params.items() if key in self.SUPPORTED_PARAMS
+        if run_manager:
+            await run_manager.on_llm_end(final_result)
+
+        return final_result
+
+=======
+>>>>>>> a6e41db (factor shit out)
+    def _prepare_api_params(
+        self,
+        messages: List[BaseMessage],
+        tools: Optional[List[completion_create_params.Tool]] = None,
+        stop: Optional[List[str]] = None,
+        stream: bool = False,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Prepares API parameters for a chat completion request."""
+        api_params: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": [
+                _lc_message_to_llama_message_param(m) for m in messages
+            ],  # Convert messages properly
+            "stream": stream,
         }
 
-    def _prepare_api_params(
-        self, messages: list, tools: Optional[list] = None, **kwargs
-    ) -> dict:
-        """
-        Prepare API parameters, filtering unsupported ones.
-
-        Args:
-            messages: List of message dicts for the API.
-            tools: Optional list of tool dicts.
-            **kwargs: Additional parameters.
-
-        Returns:
-            Dictionary of parameters ready for the Meta API.
-
-        Example:
-            >>> llama = ChatMetaLlama(model_name="Llama-4-Maverick-17B-128E-Instruct-FP8")
-            >>> llama._prepare_api_params([{"role": "user", "content": "hi"}], tools=[{"type": "function", ...}])
-            {'model': 'Llama-4-Maverick-17B-128E-Instruct-FP8', 'messages': [{'role': 'user', 'content': 'hi'}], 'tools': [{...}]}
-        """
-        api_params = {k: v for k, v in kwargs.items() if k in self.SUPPORTED_PARAMS}
-        api_params["model"] = self.model_name
-        api_params["messages"] = messages
+        # Add parameters from instance, potentially overridden by kwargs
         if self.temperature is not None:
             api_params["temperature"] = self.temperature
-        if self.max_tokens is not None:
-            api_params["max_completion_tokens"] = self.max_tokens
         if self.repetition_penalty is not None:
             api_params["repetition_penalty"] = self.repetition_penalty
+
+        # Explicitly add/override parameters from kwargs if provided and supported
+        for key in ["temperature", "repetition_penalty", "top_p", "top_k", "user"]:
+            if key in kwargs:
+                api_param_name = key
+                # Check if the parameter is generally supported by the ChatMetaLlama class
+                # before adding it to API params. Note: This still relies on SUPPORTED_PARAMS
+                # which includes max_completion_tokens, but we are manually excluding it here.
+                if api_param_name in self.SUPPORTED_PARAMS:
+                    api_params[api_param_name] = kwargs.pop(key)
+
+        # Handle max_tokens (alias max_completion_tokens for Llama API)
+        # Prefer max_tokens from direct call (via kwargs) > self.max_tokens
+        max_tokens_val = kwargs.pop("max_tokens", self.max_tokens)
+        if max_tokens_val is not None:
+            api_params["max_completion_tokens"] = max_tokens_val
+
+        # Add tools if provided
         if tools:
             api_params["tools"] = tools
-        return api_params
-
-    @classmethod
-    def create_async(
-        cls,
-        *,  # Make all args keyword-only for clarity
-        model: Optional[str] = None,  # Alias for model_name
-        model_name: Optional[str] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        max_completion_tokens: Optional[int] = None,  # Alias for max_tokens
-        repetition_penalty: Optional[float] = None,
-        api_key: Optional[str] = None,  # Alias for llama_api_key
-        llama_api_key: Optional[str] = None,
-        base_url: Optional[str] = None,  # Alias for llama_base_url
-        llama_base_url: Optional[str] = None,
-        **kwargs: Any,  # For any other args BaseChatModel might take
-    ) -> "ChatMetaLlama":
-        """Create an instance of ChatMetaLlama with an async client."""
-        try:
-            from llama_api_client import AsyncLlamaAPIClient
-        except ImportError:
-            raise ImportError(
-                "llama-api-client package not found, please install it with "
-                "`pip install llama-api-client`"
-            )
-
-        # Resolve API key
-        resolved_api_key = llama_api_key if llama_api_key is not None else api_key
-        if resolved_api_key is None:
-            resolved_api_key = os.environ.get("META_API_KEY")
-            if not resolved_api_key:
-                raise ValueError(
-                    "META_API_KEY not found. Set it via environment variable or pass it directly."
+            # If tools are present and no specific tool_choice is given, set to "auto"
+            # to encourage the model to use the tools.
+            if (
+                "tool_choice" not in api_params
+                and kwargs.get("tool_choice", None) is None
+            ):
+                api_params["tool_choice"] = "auto"
+                logger.debug(
+                    "Set tool_choice='auto' as tools are present and no specific choice was made."
                 )
 
-        # Resolve base URL
-        resolved_base_url = llama_base_url if llama_base_url is not None else base_url
-        if resolved_base_url is None:
-            resolved_base_url = os.environ.get(
-                "META_NATIVE_API_BASE_URL", "https://api.llama.com/v1/"
+        # Add stop if provided
+        if stop:
+            api_params["stop"] = stop
+
+        # Add response_format if provided (for structured output)
+        if "response_format" in kwargs:
+            # Meta uses response_format parameter for json_schema output
+            api_params["response_format"] = kwargs.pop("response_format")
+
+        # Check for any remaining kwargs that are not supported and warn
+        # Add max_tokens explicitly to the list of ignored keys here since it's a known unsupported param for the client
+        IGNORED_PARAMS = [
+            "client",
+            "async_client",
+            "run_manager",
+            "callbacks",
+            "max_tokens",
+            "system_prompt",  # Handled via messages, not directly
+        ]
+        for key in kwargs.keys():
+            # Also check if the key is in SUPPORTED_PARAMS but is one we are explicitly excluding for this client version
+            if key not in self.SUPPORTED_PARAMS and key not in IGNORED_PARAMS:
+                logger.warning(
+                    f"Unsupported parameter passed to API call: {key}. It will be ignored."
+                )
+
+        # Ensure tool_choice is never sent to the Llama API endpoint
+        api_params.pop("tool_choice", None)
+
+        return api_params
+
+    def _get_invocation_params(self, **kwargs: Any) -> Dict[str, Any]:
+        """Gets the parameters for a chat completion invocation."""
+        return {
+            "model": self.model_name,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "repetition_penalty": self.repetition_penalty,
+            "top_p": kwargs.get("top_p", 1.0),
+            "top_k": kwargs.get("top_k", 0),
+        }
+
+    def _count_tokens(self, messages: List[BaseMessage]) -> int:
+        """Counts the number of tokens in a list of messages."""
+        return sum(len(message.content) for message in messages)
+
+    def _extract_content_from_response(self, response: Any) -> str:
+        """Extracts content from a chat completion response."""
+        if isinstance(response, dict) and "choices" in response:
+            for choice in response["choices"]:
+                if "message" in choice and "content" in choice["message"]:
+                    return choice["message"]["content"]
+        return ""
+
+    def get_token_ids(self, text: str) -> List[int]:
+        """Approximate token IDs using character length."""
+        # This is a simple fallback. A more accurate method would use a proper tokenizer.
+        # For basic testing and fallback, counting characters or simple splitting is sufficient.
+        # We return a list of integers to match the expected return type.
+        return [
+            ord(c) for c in text
+        ]  # Using ASCII values as a placeholder for token IDs
+
+    def get_num_tokens(self, text: str) -> int:
+        """Get the number of tokens in a text string.
+
+        Uses character count as a simple approximation.
+        """
+        return len(self.get_token_ids(text))
+
+    def bind_tools(
+        self,
+        tools: Sequence[Union[Dict[str, Any], Type[BaseModel], Callable, BaseTool]],
+        *,
+        tool_choice: Optional[Union[str, dict, Literal["any", "auto"]]] = None,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, BaseMessage]:  # MODIFIED (removed quotes)
+        """
+        Bind tool-like objects to this chat model.
+
+        Args:
+            tools: A list of tools to bind to the model.
+            tool_choice: Optional tool choice.
+            **kwargs: Aditional keyword arguments.
+
+        Returns:
+            A new Runnable with the tools bound.
+        """
+        # Correctly delegate to the model's own .bind() method,
+        # passing the tools under the 'tools' keyword.
+        logger.debug(
+            f"ChatMetaLlama.bind_tools called with tools: {[getattr(t, 'name', t) for t in tools]}, tool_choice: {tool_choice}, and kwargs: {kwargs}"
+        )
+        return self.bind(tools=tools, tool_choice=tool_choice, **kwargs)
+
+    def with_structured_output(
+        self,
+        schema: Union[Dict, Type[BaseModel]],
+        *,
+        method: Literal["function_calling", "json_mode"] = "function_calling",
+        include_raw: bool = False,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, Union[Dict, BaseModel]]:
+        """
+        Return a new runnable that returns a structured output.
+
+        Args:
+            schema: The Pydantic model or JSON schema to use for structured output.
+            method: The method to use for structured output. Options:
+                - 'function_calling': Use tool/function calling format (adapted for Meta).
+                                      The prompt should guide the model to use the tool.
+                - 'json_mode': Use Meta's native json_schema response_format.
+                               The prompt must explicitly ask for JSON output matching the schema.
+            include_raw: Whether to include the raw LLM output in the result.
+            **kwargs: Additional keyword arguments to pass to the LLM.
+
+        Returns:
+            A runnable that outputs structured data.
+        """
+        schema_name: str
+        schema_dict: Dict
+
+        if isinstance(schema, type) and issubclass(schema, BaseModel):
+            schema_name = schema.__name__
+            schema_dict = schema.model_json_schema()
+        elif isinstance(schema, dict):
+            schema_name = schema.get("name", schema.get("title", "OutputSchema"))
+            schema_dict = schema
+        else:
+            raise ValueError(f"Unsupported schema type: {type(schema)}")
+
+        # Default temperature for structured output if not provided in kwargs
+        if "temperature" not in kwargs:
+            kwargs["temperature"] = 0.1
+
+        llm_for_binding: BaseChatModel = self
+        llm_with_schema_binding: Runnable[LanguageModelInput, BaseMessage]
+
+        if method == "json_mode":
+            logger.debug(
+                f"Binding 'response_format' for Meta's json_schema mode with schema '{schema_name}'"
             )
+            # For json_mode, the prompt given to the LLM must instruct it to produce JSON.
+            # We bind the response_format parameter to tell the Llama API to enforce schema.
+            if (
+                "system_prompt" in kwargs
+            ):  # system_prompt is not a direct API kwarg for bind
+                logger.warning(
+                    "'system_prompt' kwarg to 'with_structured_output' with 'json_mode' is not "
+                    "directly bound as an API parameter. It should be part of input messages."
+                )
+                kwargs.pop("system_prompt", None)
 
-        # Create async client
-        async_client = AsyncLlamaAPIClient(
-            api_key=str(resolved_api_key),
-            base_url=str(resolved_base_url),
-        )
+            bound_params = {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        # "name": schema_name, # Name is not part of Meta's spec for json_schema content here
+                        "schema": schema_dict,
+                    },
+                },
+                **kwargs,  # Other kwargs like temperature
+            }
+            llm_with_schema_binding = llm_for_binding.bind(**bound_params)
 
-        # Create instance with async client
-        return cls(
-            model=model,
-            model_name=model_name,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            max_completion_tokens=max_completion_tokens,
-            repetition_penalty=repetition_penalty,
-            client=async_client,  # Pass the async client
-            **kwargs,
-        )
+        elif method == "function_calling":
+            tool_definition = {
+                "type": "function",
+                "function": {
+                    "name": schema_name,
+                    "description": schema_dict.get(
+                        "description", f"Schema for {schema_name}"
+                    ),
+                    "parameters": schema_dict,
+                },
+            }
+            logger.debug(
+                f"Binding 'tools' for function calling with schema '{schema_name}'"
+            )
+            if (
+                "system_prompt" in kwargs
+            ):  # system_prompt is not a direct API kwarg for bind
+                logger.warning(
+                    "'system_prompt' kwarg to 'with_structured_output' with 'function_calling' is not "
+                    "directly bound as an API parameter. It should be part of input messages."
+                )
+                kwargs.pop("system_prompt", None)
 
+            llm_with_schema_binding = llm_for_binding.bind(
+                tools=[tool_definition], **kwargs
+            )
+        else:
+            raise ValueError(f"Unsupported method for structured output: {method}")
 
-# Variables to help with consistent mock creation in tests
-API_ERROR_DETAILS = {
-    "message": "Rate limit exceeded",
-    "status": 429,
-    "request": {"method": "POST", "url": "https://api.llama.com/v1/chat/completions"},
-    "response": {"body": {"error": {"code": 429}}},
-}
+        # Setup appropriate output parser
+        output_parser: Runnable[BaseMessage, Union[Dict, BaseModel]]
+        if method == "json_mode":
+
+            def _parse_json_output(
+                message: BaseMessage,
+            ) -> Union[Dict, BaseModel]:
+                if not isinstance(message, AIMessage):
+                    raise TypeError(
+                        f"Expected AIMessage for json_mode parsing, got {type(message)}"
+                    )
+                json_string = message.content
+                if not isinstance(json_string, str) or not json_string.strip():
+                    # If content is not a non-empty string, attempt to dump if dict/list, else error
+                    if isinstance(json_string, (dict, list)):
+                        try:
+                            json_string = json.dumps(json_string)
+                        except TypeError as e:
+                            raise ValueError(
+                                f"AIMessage content is not a JSON string or serializable: {json_string}, error: {e}"
+                            )
+                    else:
+                        raise ValueError(
+                            f"AIMessage content is not a JSON string for json_mode: {json_string}"
+                        )
+
+                try:
+                    if isinstance(schema, type) and issubclass(schema, BaseModel):
+                        return schema.parse_raw(json_string)
+                    else:  # dict schema
+                        return json.loads(json_string)
+                except (
+                    json.JSONDecodeError,
+                    ValidationError,
+                ) as e:  # ValidationError from Pydantic
+                    logger.error(
+                        f"Failed to parse JSON output for schema '{schema_name}': {e}. Content: '{json_string}'"
+                    )
+                    raise ValueError(
+                        f"Output could not be parsed as {schema_name}: {e}. Received: '{json_string}'"
+                    )
+
+            output_parser = RunnableLambda(_parse_json_output)
+        else:  # function_calling
+            if isinstance(schema, type) and issubclass(schema, BaseModel):
+                output_parser = PydanticToolsParser(
+                    tools=[schema], first_tool_only=True
+                )
+            else:  # dict schema
+                output_parser = JsonOutputKeyToolsParser(
+                    key_name=schema_name, first_tool_only=True, return_single=True
+                )
+
+        if include_raw:
+            # Assigns the parsed output to a "parsed" key in the output dict
+            return llm_with_schema_binding | RunnablePassthrough.assign(
+                parsed=output_parser
+            )
+        else:
+            return llm_with_schema_binding | output_parser

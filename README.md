@@ -1,9 +1,9 @@
 # langchain-meta
 
-Native integration between the [Meta Llama API](https://www.llama.com/products/llama-api/) 🦙 and the [LangChain/LangGraph ecosystem](https://www.langchain.com/), ⛓ providing fast hosted access to Meta's powerful Llama 4 models to power your Langgraph agents. 
+Native integration between the [Meta Llama API](https://www.llama.com/products/llama-api/) 🦙 and the [LangChain/LangGraph ecosystem](https://www.langchain.com/), ⛓ providing fast hosted access to Meta's powerful Llama 4 models to power your Langgraph agents.
 Fully implements [ChatModel interface](https://python.langchain.com/docs/concepts/chat_models/).
 
-## Installation 
+## Installation
 
 ```bash
 pip install langchain-meta
@@ -14,7 +14,7 @@ Set up your credentials with environment variables:
 ```bash
 export META_API_KEY="your-api-key"
 export META_API_BASE_URL="https://api.llama.com/v1"
-export META_MODEL_NAME="Llama-4-Maverick-17B-128E-Instruct-FP8" 
+export META_MODEL_NAME="Llama-4-Maverick-17B-128E-Instruct-FP8"
 # Optional, see list: https://llama.developer.meta.com/docs/api/models/
 ```
 
@@ -37,6 +37,27 @@ from langchain_core.messages import HumanMessage
 response = llm.invoke([HumanMessage(content="Hello Llama!")])
 print(response.content)
 ```
+
+### LangSmith Integration
+
+ChatMetaLlama is fully compatible with [LangSmith](https://smith.langchain.com/), providing comprehensive tracing and observability for your Meta LLM applications.
+
+Key features of LangSmith integration:
+
+- **Token Usage Tracking**: Get accurate input/output token counts for cost estimation
+- **Request/Response Logging**: View full context of all prompts and completions
+- **Tool Execution Tracing**: Monitor tool calls and their execution
+- **Runtime Metrics**: Track latency and other performance metrics
+
+To enable LangSmith tracing, set these environment variables:
+
+```bash
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY="your-api-key"
+export LANGSMITH_PROJECT="your-project-name"
+```
+
+See the [examples/langsmith_integration.py](./examples/langsmith_integration.py) script for a complete example of LangSmith integration.
 
 ### Utility Functions
 
@@ -91,6 +112,7 @@ parsed_json = extract_json_response(result.content)
 - **Seamless Tool Calling**: Intelligent conversion between LangChain tool formats and Llama API requirements
 - **Complete Message History Support**: Proper conversion of all LangChain message types
 - **Multi-Agent System Compatibility**: Drop-in replacement for ChatOpenAI in LangGraph workflows
+- **LangSmith Integration**: Full observability and tracing for debugging and monitoring
 
 ## Chat Models
 
@@ -123,12 +145,33 @@ llm_with_tools = llm.bind_tools([get_weather])
 response = llm_with_tools.invoke("What's the weather in Seattle?")
 ```
 
+### LangGraph Serialization Support
+
+To solve serialization issues with LangGraph, `ChatMetaLlama` provides a built-in message serializer:
+
+```python
+from langchain_meta import ChatMetaLlama
+from langgraph.serde import register_type_serializer
+from langchain_core.messages import AIMessage
+
+# Register the serializer with LangGraph
+register_type_serializer(
+    AIMessage,
+    serialize_fn=ChatMetaLlama.get_message_serializer(),
+    deserialize_fn=lambda x: AIMessage(**x)
+)
+
+# Now your graph nodes can properly serialize AIMessage objects
+# See examples/langgraph_serialization.py for a complete example
+```
+
 ## Advanced Features
 
 - **Streaming Support**: Streaming implementation for both content and tool calls
 - **Context Preservation**: Correctly handles the full conversation context in agent graphs
 - **Error Resilience**: Robust handling of tool call parsing errors and response validation
 - **Format Compatibility**: Support for structured output Pydantic objects
+- **Observability**: Complete LangSmith integration for tracing and debugging
 
 ## Contributing
 
@@ -137,7 +180,6 @@ We welcome contributions! Please see the [CONTRIBUTING.md](CONTRIBUTING.md) file
 ## License
 
 This project is licensed under the MIT License.
-
 
 Llama 4, Llama AI API, etc trademarks belong to their respective owners (Meta)
 I just made this to make my life easier and thought I'd share. 😊

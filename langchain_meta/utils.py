@@ -3,15 +3,22 @@ Meta-specific utility functions for better integration with LangChain and LangGr
 """
 
 import json
-import re
 import logging
-from typing import Dict, Any, Optional, List, Type, Union
+import re
+from typing import Any, Dict, List, Optional, Type, Union
 
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables.base import RunnableSequence, Runnable
-from langchain_core.tools import StructuredTool
 from langchain_core.language_models import BaseChatModel
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.runnables.base import RunnableSequence
+from langchain_core.tools import StructuredTool
 from pydantic import BaseModel
 
 # Set up logging
@@ -24,6 +31,7 @@ def meta_agent_factory(
     output_schema: Optional[Union[Type[BaseModel], dict]] = None,
     disable_streaming: bool = False,
     additional_tags: Optional[List[str]] = None,
+    method: str = "json_mode",
 ) -> RunnableSequence:
     """
     Create a Meta-specific agent with structured output support.
@@ -50,26 +58,82 @@ def meta_agent_factory(
         >>> agent = meta_agent_factory(llm, tools=tools, output_schema=MySchema)
         >>> result = agent.invoke({"messages": [...]})
     """
+    # Always disable streaming for structured output - this is crucial for Meta LLMs
+    if output_schema is not None or disable_streaming:
+        # Force disable streaming at the LLM level for more reliable outputs
+        if hasattr(llm, "streaming") and llm.streaming:
+            logger.debug("Disabling streaming in LLM for structured output reliability")
+            llm = llm.bind(streaming=False)
+    
+    # Set low temperature for structured output - critical for Meta models
+    if hasattr(llm, "temperature") and (llm.temperature is None or llm.temperature > 0.2):
+        logger.debug("Setting temperature=0.1 for more reliable structured output")
+        llm = llm.bind(temperature=0.1)
+    
     # Use structured output if schema is provided
     if output_schema is not None:
-        logger.debug(f"Using structured output with schema: {output_schema}")
+        logger.debug(f"Attempting to use structured output with schema: {output_schema}")
         
         try:
-            # Use with_structured_output but add it to a chain properly
-            bound_llm_wrapper = llm.with_structured_output(output_schema, include_raw=False)
+            # Ensure schema is of the correct type
+            if not (isinstance(output_schema, type) and issubclass(output_schema, BaseModel)) and \
+               not isinstance(output_schema, dict):
+                raise ValueError(
+                    "output_schema must be a Pydantic model class or a dict for with_structured_output."
+                )
+
+            # Prepare schema for Meta's response_format
+            if isinstance(output_schema, type) and issubclass(output_schema, BaseModel):
+                schema_name = output_schema.__name__
+                schema_dict = output_schema.model_json_schema()
+            else:
+                schema_name = output_schema.get("name", "OutputSchema")
+                schema_dict = output_schema
             
-            # Important: Wrap with RunnablePassthrough to ensure it's a proper Runnable
-            bound_llm = RunnablePassthrough() | bound_llm_wrapper
+            # Apply Meta-specific response_format structure
+            llm = llm.bind(
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "schema": schema_dict,
+                    }
+                }
+            )
             
-            # Set streaming explicitly if needed
-            if disable_streaming:
-                bound_llm = bound_llm.bind(stream=False)
+            # Also use the LangChain with_structured_output for backward compatibility
+            try:
+                bound_llm_wrapper = llm.with_structured_output(output_schema, include_raw=False)
+                bound_llm = RunnablePassthrough() | bound_llm_wrapper
+            except Exception as struct_e:
+                logger.warning(f"Error using with_structured_output: {struct_e}. Using direct response_format instead.")
+                bound_llm = llm
+
         except Exception as e:
-            logger.error(f"Error setting up structured output: {e}")
-            # Fall back to regular LLM
+            logger.error(f"Error setting up structured output: {e}", exc_info=True)
+            logger.info("Falling back to default LLM behavior without structured output.")
+            # Fall back to regular LLM if structured output setup fails
             bound_llm = llm
+            
+    elif tools:
+        logger.debug(f"Binding provided tools: {[tool.name for tool in tools if hasattr(tool, 'name')]}")
+        try:
+            # Make sure to disable streaming for tool calling with Meta LLMs
+            if disable_streaming and hasattr(llm, "streaming") and llm.streaming:
+                llm = llm.bind(streaming=False)
+                
+            # Set low temperature for tool calling
+            if hasattr(llm, "temperature") and (llm.temperature is None or llm.temperature > 0.2):
+                llm = llm.bind(temperature=0.1)
+                
+            # This will now call the (correctly implemented) bind_tools on the llm.
+            bound_llm = llm.bind_tools(tools)
+        except Exception as e:
+            logger.error(f"Error binding tools: {e}", exc_info=True)
+            logger.info("Falling back to default LLM behavior without tools.")
+            bound_llm = llm # Fallback
     else:
-        # No schema provided, just use regular LLM
+        # Default case: no schema, no tools
         bound_llm = llm
     
     # Add any additional tags
@@ -78,13 +142,36 @@ def meta_agent_factory(
             bound_llm = bound_llm.bind(tags=additional_tags)
     
     # Create a basic prompt
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt_text),
-        MessagesPlaceholder(variable_name="messages"),
-    ])
+    try:
+        # Create the prompt template safely, avoiding issues with parsing
+        # curly braces in the system prompt (like {\"next\": \"value\"})
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessage(content=system_prompt_text),
+            MessagesPlaceholder(variable_name="messages"),
+        ])
+    except Exception as prompt_error:
+        logger.error(f"Error creating prompt template: {prompt_error}. Using a direct SystemMessage instead.")
+        # Fallback approach if template creation fails
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt_text),
+            MessagesPlaceholder(variable_name="messages"),
+        ])
     
     # Return the full chain
-    return prompt | bound_llm
+    def ensure_list_output(output):
+        # If output is a dict with "messages", return as is
+        if isinstance(output, dict) and "messages" in output:
+            return output
+        # If output is a single BaseMessage, wrap in a list
+        if isinstance(output, BaseMessage):
+            return {"messages": [output]}
+        # If output is a list of BaseMessages, wrap in dict
+        if isinstance(output, list) and all(isinstance(m, BaseMessage) for m in output):
+            return {"messages": output}
+        # Otherwise, return as is
+        return output
+
+    return (prompt | bound_llm) | RunnableLambda(ensure_list_output)
 
 
 def extract_json_response(content: Any) -> Any:
@@ -127,7 +214,7 @@ def extract_json_response(content: Any) -> Any:
     if match:
         try:
             return json.loads(match.group(1))
-        except:
+        except:  # noqa: E722
             pass
             
     # If we get here, return the original content

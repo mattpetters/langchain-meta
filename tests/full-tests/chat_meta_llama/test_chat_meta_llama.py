@@ -13,7 +13,7 @@ from langchain_core.messages import (
     ToolMessage,
     BaseMessage,
 )
-from pydantic.v1 import BaseModel, Field as PydanticField
+from pydantic import BaseModel, Field as PydanticField
 from langchain_core.tools import tool as lc_tool_decorator
 from langchain_core.outputs import ChatResult, ChatGenerationChunk
 from llama_api_client import APIError, APIStatusError

@@ -1,0 +1,10 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+Before creating editing moving or deleting files, use pwd to ensure you're in the right directory.
+Before creating files, search to see if they already exist or there's a better place to update rather than create new.
+When encountering package errors/incorrect imports for libraries, please always use @Web tool / search the web immediately to not waste time guessing on outdated info or APIs.
+Always be aware of what version you're working with when looking up documentation or referencing materials.
+Never use Pydantic v1, it is deprecated. Always use Pydantic v2
