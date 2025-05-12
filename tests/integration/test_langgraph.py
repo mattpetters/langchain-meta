@@ -15,6 +15,8 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph, add_messages
 from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
+import importlib
+import typing
 
 from langchain_meta.chat_models import ChatMetaLlama
 
@@ -227,6 +229,88 @@ async def async_get_graph_final_state_messages(
     return all_messages_in_final_state
 
 
+def import_tool_from_langchain_tools():
+    try:
+        langchain_tools = importlib.import_module("langchain.tools")
+        return getattr(langchain_tools, "tool")
+    except (ImportError, AttributeError):
+        return None
+
+
+@pytest.mark.integration
+def test_chat_meta_llama_with_langchain_tools_decorator():
+    """Test tool calling with @tool from langchain.tools (not langchain_core.tools)."""
+    tool_decorator = import_tool_from_langchain_tools()
+    if tool_decorator is None:
+        pytest.skip("langchain.tools.tool not available; skipping test.")
+
+    @tool_decorator
+    def get_time_lc_tools():
+        """Get the current time (langchain.tools)."""
+        from datetime import datetime
+
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Use only this tool for the test
+    tools = [get_time_lc_tools]
+
+    # Build a minimal graph for this test
+    def call_model_lc_tools(state: State, config: RunnableConfig):
+        messages = state["messages"]
+        api_key = os.getenv("META_API_KEY")
+        if not api_key:
+            pytest.skip("META_API_KEY not set, skipping integration test.")
+        model = ChatMetaLlama(
+            model_name="Llama-4-Maverick-17B-128E-Instruct-FP8",
+            temperature=0.0,
+            api_key=api_key,
+        )
+        model_with_tools = model.bind_tools(tools)
+        response = model_with_tools.invoke(messages, config=config)
+        return {"messages": [response]}
+
+    graph_builder = StateGraph(State)
+    graph_builder.add_node("chatbot", call_model_lc_tools)
+    graph_builder.add_node("tools", ToolNode(tools))
+    graph_builder.add_edge(START, "chatbot")
+    graph_builder.add_conditional_edges("chatbot", should_continue)
+    graph_builder.add_edge("tools", "chatbot")
+    memory = MemorySaver()
+    app = graph_builder.compile(checkpointer=memory)
+
+    # Run the graph
+    thread_id = "test-langchain-tools-thread"
+    config = typing.cast(RunnableConfig, {"configurable": {"thread_id": thread_id}})
+    events = app.stream(
+        {"messages": [HumanMessage(content="What is the time?")]},
+        config,
+        stream_mode="values",
+    )
+    final_state = None
+    all_messages = []
+    for event in events:
+        if isinstance(event, dict) and "messages" in event:
+            all_messages.extend(event["messages"])
+            final_state = event
+    assert all_messages
+    found_tool_message_with_time = False
+    for msg in all_messages:
+        if isinstance(msg, ToolMessage) and msg.name == "get_time_lc_tools":
+            import re
+
+            if re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", str(msg.content)):
+                found_tool_message_with_time = True
+                break
+    assert found_tool_message_with_time, (
+        "No ToolMessage found with correctly formatted current time using langchain.tools.tool."
+    )
+    assert (
+        all_messages
+        and isinstance(all_messages[-1], AIMessage)
+        and all_messages[-1].content
+    ), "Final message was not an AIMessage with content (langchain.tools.tool)."
+
+
 @pytest.mark.integration
 def test_chat_meta_llama_integration():
     """Tests basic tool calling and response generation (SYNC)."""
@@ -345,3 +429,93 @@ async def test_async_chat_meta_llama_integration():  # New async test
             isinstance(m, ToolMessage) and m.name == "tavily_search"
             for m in tavily_messages
         ), "ASYNC: No ToolMessage found for tavily_search in the final state messages."
+
+
+def import_interrupt_from_langgraph_types():
+    try:
+        langgraph_types = importlib.import_module("langgraph.types")
+        return getattr(langgraph_types, "interrupt")
+    except (ImportError, AttributeError):
+        return None
+
+
+def import_command_from_langgraph_types():
+    try:
+        langgraph_types = importlib.import_module("langgraph.types")
+        return getattr(langgraph_types, "Command")
+    except (ImportError, AttributeError):
+        return None
+
+
+@pytest.mark.integration
+def test_human_assistance_tool_resume_with_command():
+    """Test resuming a human_assistance interrupt with a Command(resume=...) and getting the human response."""
+    interrupt = import_interrupt_from_langgraph_types()
+    Command = import_command_from_langgraph_types()
+    if interrupt is None or Command is None:
+        pytest.skip(
+            "langgraph.types.interrupt or Command not available; skipping test."
+        )
+
+    @tool
+    def human_assistance(query: str) -> str:
+        """Request assistance from a human."""
+        human_response = interrupt({"query": query})
+        return human_response["data"]
+
+    tools = [get_current_time, human_assistance]
+
+    def call_model_human_assist(state: State, config: RunnableConfig):
+        messages = state["messages"]
+        api_key = os.getenv("META_API_KEY")
+        if not api_key:
+            pytest.skip("META_API_KEY not set, skipping integration test.")
+        model = ChatMetaLlama(
+            model_name="Llama-4-Maverick-17B-128E-Instruct-FP8",
+            temperature=0.0,
+            api_key=api_key,
+        )
+        model_with_tools = model.bind_tools(tools)
+        response = model_with_tools.invoke(messages, config=config)
+        return {"messages": [response]}
+
+    graph_builder = StateGraph(State)
+    graph_builder.add_node("chatbot", call_model_human_assist)
+    graph_builder.add_node("tools", ToolNode(tools))
+    graph_builder.add_edge(START, "chatbot")
+    graph_builder.add_conditional_edges("chatbot", should_continue)
+    graph_builder.add_edge("tools", "chatbot")
+    memory = MemorySaver()
+    app = graph_builder.compile(checkpointer=memory)
+
+    thread_id = "test-human-assistance-interrupt-resume"
+    config = typing.cast(RunnableConfig, {"configurable": {"thread_id": thread_id}})
+    input_text = "I need some expert guidance for building an AI agent. Could you request assistance for me?"
+    # Step 1: Run until interrupt
+    events = app.stream(
+        {"messages": [HumanMessage(content=input_text)]}, config, stream_mode="values"
+    )
+    found_interrupt = False
+    for event in events:
+        if isinstance(event, dict) and any("interrupt" in k for k in event.keys()):
+            found_interrupt = True
+            break
+    assert found_interrupt, "No interrupt was surfaced by the human_assistance tool."
+
+    # Step 2: Resume with Command(resume={"data": ...})
+    human_response = (
+        "We, the experts are here to help! We'd recommend you check out LangGraph to build your agent."
+        " It's much more reliable and extensible than simple autonomous agents."
+    )
+    human_command = Command(resume={"data": human_response})
+    events = app.stream(human_command, config, stream_mode="values")
+    found_human_response = False
+    for event in events:
+        if isinstance(event, dict) and "messages" in event:
+            last_msg = event["messages"][-1]
+            if hasattr(last_msg, "content") and human_response in str(last_msg.content):
+                found_human_response = True
+                break
+    assert found_human_response, (
+        "The human response was not found in the final message after resuming with Command."
+    )
