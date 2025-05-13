@@ -173,6 +173,36 @@ register_type_serializer(
 - **Format Compatibility**: Support for structured output Pydantic objects
 - **Observability**: Complete LangSmith integration for tracing and debugging
 
+## Robust Tool Call Normalization
+
+This module automatically normalizes all tool calls from Llama/Meta API:
+
+- Ensures every tool call has a valid string `id` (generates one if missing/empty)
+- Ensures `name` is a string (defaults to `"unknown_tool"` if missing)
+- Ensures `args` is a dict (parses JSON if string, else wraps as `{"value": ...}`)
+- Always sets `type` to `"function"`
+- Logs a warning for any repair
+
+**Best Practices:**
+
+- Define your tool schemas as simply as possible (avoid advanced JSON Schema features).
+- Provide clear prompt examples to the LLM for tool calling.
+- Be aware of backend limitations (see [vLLM Issue #15236](https://github.com/vllm-project/vllm/issues/15236)).
+
+Your code is robust to malformed tool calls, but clear schemas and prompts will maximize reliability.
+
+## Defensive Tool Call Handling
+
+LangChain Meta includes robust defensive mechanisms for handling malformed tool calls:
+
+- Always ensures `tool_call_id` is a non-empty string (generates UUID if missing/empty)
+- Always ensures `name` is a string (fallback to 'unknown_tool')
+- Always ensures `args` is a dict (tries to parse string as JSON, else wraps as {'value': ...})
+- Always sets `type` to 'function'
+- Logs warnings for any repairs made
+
+This makes the integration more resilient when working with models that may sometimes produce malformed tool calls.
+
 ## Contributing
 
 We welcome contributions! Please see the [CONTRIBUTING.md](CONTRIBUTING.md) file for details.

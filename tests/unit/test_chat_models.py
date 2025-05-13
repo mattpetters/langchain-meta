@@ -33,6 +33,11 @@ from langchain_meta import ChatMetaLlama
 from langchain_meta.chat_models import (
     LLAMA_DEFAULT_MODEL_NAME,
 )
+from langchain_meta.chat_meta_llama.serialization import (
+    _lc_tool_to_llama_tool_param,
+    _normalize_tool_call,
+
+)
 
 # Import parse_malformed_args_string function from utils.py
 from langchain_meta.utils import parse_malformed_args_string
@@ -915,6 +920,7 @@ async def test_langgraph_serialization_compatibility(
         pytest.fail(f"Result is not JSON serializable: {e}")
 
 
+
 def test_parse_malformed_args_string_empty():
     """Test that empty arguments return an empty dict."""
     assert parse_malformed_args_string("") == {}
@@ -968,3 +974,31 @@ def test_parse_malformed_args_string_fallback():
     assert parse_malformed_args_string("[1, 2, 3]") == {
         "value": "[1, 2, 3]"
     }  # Not valid key=value format
+    
+def test_normalize_tool_call_various_cases():
+    from langchain_meta.chat_meta_llama.serialization import _normalize_tool_call
+
+    # Case: missing id, args as string
+    tc = {"name": "foo", "args": '{"bar": 1}'}
+    norm = _normalize_tool_call(tc)
+    assert isinstance(norm["id"], str) and norm["id"]
+    assert norm["name"] == "foo"
+    assert norm["args"] == {"bar": 1}
+    assert norm["type"] == "function"
+
+    # Case: args as non-dict, non-string
+    tc = {"name": "foo", "args": 123}
+    norm = _normalize_tool_call(tc)
+    assert norm["args"] == {"value": "123"}
+
+    # Case: missing name
+    tc = {"id": "abc", "args": {}}
+    norm = _normalize_tool_call(tc)
+    assert norm["name"] == "unknown_tool"
+
+    # Case: id present, name present, args already dict
+    tc = {"id": "id123", "name": "bar", "args": {"x": 1}}
+    norm = _normalize_tool_call(tc)
+    assert norm["id"] == "id123"
+    assert norm["name"] == "bar"
+    assert norm["args"] == {"x": 1}
