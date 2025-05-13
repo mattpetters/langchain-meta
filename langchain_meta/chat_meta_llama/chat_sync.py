@@ -151,6 +151,32 @@ class SyncChatMetaLlamaMixin:
         else:
             logger.debug("_generate (sync): No effective tools to prepare.")
 
+        # Determine structured output details for metadata
+        structured_output_metadata = None
+        is_json_mode = (
+            isinstance(kwargs.get("response_format"), dict) and
+            kwargs["response_format"].get("type") == "json_schema"
+        )
+        is_function_calling = bool(prepared_llm_tools)
+        if is_json_mode or is_function_calling:
+            current_schema_dict = None
+            current_method = None
+            if is_json_mode:
+                current_method = "json_mode"
+                current_schema_dict = kwargs["response_format"]["json_schema"].get("schema")
+            elif is_function_calling and prepared_llm_tools:
+                current_method = "function_calling"
+                if prepared_llm_tools[0].get("function") and prepared_llm_tools[0]["function"].get("parameters"):
+                    current_schema_dict = prepared_llm_tools[0]["function"]["parameters"]
+            if current_schema_dict and current_method:
+                structured_output_metadata = {
+                    "ls_structured_output_format": {
+                        "schema": current_schema_dict,
+                        "method": current_method,
+                    }
+                }
+                logger.debug(f"_generate: Prepared structured output metadata: {structured_output_metadata}")
+
         final_kwargs_for_prepare = kwargs.copy()
         final_kwargs_for_prepare.pop("tools", None)
         if tool_choice is not None:
@@ -163,25 +189,6 @@ class SyncChatMetaLlamaMixin:
             stream=False,
             **final_kwargs_for_prepare,
         )
-
-        if self.temperature is not None and "temperature" not in api_params:
-            api_params["temperature"] = self.temperature
-        # max_tokens from self.max_tokens is handled by _prepare_api_params if it's in **kwargs as max_completion_tokens
-        # or if self.max_tokens is directly used by _prepare_api_params.
-        # Here, we ensure it's passed if not already set by _prepare_api_params logic
-        if (
-            self.max_tokens is not None and "max_completion_tokens" not in api_params
-        ):  # llama client uses max_completion_tokens
-            if (
-                "max_tokens" not in api_params
-            ):  # Check if 'max_tokens' alias is also not there
-                api_params["max_completion_tokens"] = self.max_tokens
-
-        if (
-            self.repetition_penalty is not None
-            and "repetition_penalty" not in api_params
-        ):
-            api_params["repetition_penalty"] = self.repetition_penalty
 
         logger.debug(f"Llama API (sync) Request: {api_params}")
         try:
@@ -510,6 +517,19 @@ class SyncChatMetaLlamaMixin:
                     )
 
         # === Callback Handling End for on_llm_end ===
+
+        # Trigger on_chat_model_start callback with metadata
+        if llm_run_manager:
+            invocation_params = self._get_invocation_params(
+                api_params=api_params,
+                **final_kwargs_for_prepare
+            )
+            # This callback should be handled by the base class before _generate is called.
+            # If we need to pass options/metadata, it should happen via the config.
+            pass # Placeholder - Callback triggering is handled by base class
+
+        if self.temperature is not None and "temperature" not in api_params:
+            api_params["temperature"] = self.temperature
 
         return result
 

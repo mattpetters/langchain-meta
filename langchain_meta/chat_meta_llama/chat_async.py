@@ -14,6 +14,7 @@ from typing import (
     Type,
     Union,
     cast,
+    Tuple,
 )
 
 from langchain_core.callbacks.manager import AsyncCallbackManagerForLLMRun
@@ -156,9 +157,36 @@ class AsyncChatMetaLlamaMixin:
             messages, tools=prepared_llm_tools, **final_kwargs_for_prepare
         )
 
-        if run_manager:
-            self._count_tokens(messages)
-            pass
+        # === Structured Output Metadata Injection ===
+        structured_output_metadata = None
+        is_json_mode = (
+            isinstance(final_kwargs_for_prepare.get("response_format"), dict) and
+            final_kwargs_for_prepare["response_format"].get("type") == "json_schema"
+        )
+        is_function_calling = bool(prepared_llm_tools)
+        if is_json_mode or is_function_calling:
+            current_schema_dict = None
+            current_method = None
+            if is_json_mode:
+                current_method = "json_mode"
+                current_schema_dict = final_kwargs_for_prepare["response_format"]["json_schema"].get("schema")
+            elif is_function_calling and prepared_llm_tools:
+                current_method = "function_calling"
+                if prepared_llm_tools[0].get("function") and prepared_llm_tools[0]["function"].get("parameters"):
+                    current_schema_dict = prepared_llm_tools[0]["function"]["parameters"]
+            if current_schema_dict and current_method:
+                structured_output_metadata = {
+                    "ls_structured_output_format": {
+                        "schema": current_schema_dict,
+                        "method": current_method,
+                    }
+                }
+                logger.debug(f"_agenerate: Prepared structured output metadata: {structured_output_metadata}")
+
+        # Callback triggering (on_chat_model_start) should be handled by the base class before _agenerate
+        # We just need to ensure the parameters are correctly gathered if needed elsewhere,
+        # but we don't trigger the callback here.
+        # invocation_params = self._get_invocation_params(api_params=api_params, **final_kwargs_for_prepare)
 
         logger.debug(f"Llama API (async) Request (ainvoke): {api_params}")
         try:
@@ -604,23 +632,48 @@ class AsyncChatMetaLlamaMixin:
 
             # Process native tool calls from the API chunk first
             chunk_tool_calls_for_aimc_obj: List[ToolCallChunk] = []
-            if (
-                isinstance(chunk.message, AIMessageChunk)
-                and chunk.message.tool_call_chunks
-            ):
-                for tc_chunk_dict in chunk.message.tool_call_chunks:
+            # Access completion_message from the Llama API client's chunk object
+            llama_chunk_completion_message = getattr(chunk, "completion_message", None)
+
+            if llama_chunk_completion_message and hasattr(llama_chunk_completion_message, "tool_calls") and llama_chunk_completion_message.tool_calls:
+                # This part assumes that tool_calls arrive fully formed in a single chunk's completion_message delta,
+                # or that they are streamed as complete ToolCallChunk-like dicts by the Llama client.
+                # This might need refinement if the Llama client streams tool calls partially.
+                for tc_data in llama_chunk_completion_message.tool_calls: # tc_data would be a dict-like structure from Llama client
                     try:
-                        # Construct ToolCallChunk objects
+                        # Adapt tc_data to LangChain's ToolCallChunk structure
+                        # This requires knowing the exact structure of tc_data from Llama client for tool call deltas.
+                        # Assuming tc_data is already dict-like and contains 'id', 'name', 'args', 'index'
+                        # or can be mapped to it.
                         chunk_tool_calls_for_aimc_obj.append(
                             ToolCallChunk(
-                                name=tc_chunk_dict.get("name"),
-                                args=tc_chunk_dict.get("args", ""),
-                                id=tc_chunk_dict.get("id"),
-                                index=tc_chunk_dict.get("index"),
+                                name=getattr(tc_data.get("function", {}), "name", None),
+                                args=getattr(tc_data.get("function", {}), "arguments", ""), # Arguments are streamed as string deltas
+                                id=tc_data.get("id"),
+                                index=tc_data.get("index", current_tool_call_index) # Ensure index is present
                             )
                         )
                     except Exception as e:
-                        logger.warning(f"Could not construct ToolCallChunk: {e}")
+                        logger.warning(f"Could not construct ToolCallChunk from Llama API data: {tc_data}, error: {e}")
+            elif (
+                llama_chunk_completion_message and 
+                isinstance(llama_chunk_completion_message.content, dict) and 
+                llama_chunk_completion_message.content.get("type") == "tool_calls" and
+                isinstance(llama_chunk_completion_message.content.get("tool_calls"), list)
+            ):
+                 # Alternative path if tool calls are nested inside content like {'type': 'tool_calls', 'tool_calls': [...]}
+                for tc_data in llama_chunk_completion_message.content["tool_calls"]:
+                    try:
+                        chunk_tool_calls_for_aimc_obj.append(
+                            ToolCallChunk(
+                                name=getattr(tc_data.get("function", {}), "name", None),
+                                args=getattr(tc_data.get("function", {}), "arguments", ""),
+                                id=tc_data.get("id"),
+                                index=tc_data.get("index", current_tool_call_index)
+                            )
+                        )
+                    except Exception as e:
+                        logger.warning(f"Could not construct ToolCallChunk from Llama API content.tool_calls: {tc_data}, error: {e}")
 
             # Fallback: If no native tool calls in this chunk, try to parse from content_str
             if not chunk_tool_calls_for_aimc_obj and prepared_llm_tools and content_str:

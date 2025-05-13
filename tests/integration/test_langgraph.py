@@ -59,7 +59,7 @@ def call_model(state: State, config: RunnableConfig):
     model = ChatMetaLlama(
         model_name="Llama-4-Maverick-17B-128E-Instruct-FP8",
         temperature=0.0,
-        api_key=api_key,
+        llama_api_key=api_key,
     )
 
     # Bind tools
@@ -81,7 +81,7 @@ async def acall_model(
     model = ChatMetaLlama(
         model_name="Llama-4-Maverick-17B-128E-Instruct-FP8",
         temperature=0.0,
-        api_key=api_key,
+        llama_api_key=api_key,
     )
     model_with_tools = model.bind_tools(tools_for_binding)
     print(
@@ -265,7 +265,7 @@ def test_chat_meta_llama_with_langchain_tools_decorator():
         model = ChatMetaLlama(
             model_name="Llama-4-Maverick-17B-128E-Instruct-FP8",
             temperature=0.0,
-            api_key=api_key,
+            llama_api_key=api_key,
         )
         model_with_tools = model.bind_tools(tools)
         response = model_with_tools.invoke(messages, config=config)
@@ -475,7 +475,7 @@ def test_human_assistance_tool_resume_with_command():
         model = ChatMetaLlama(
             model_name="Llama-4-Maverick-17B-128E-Instruct-FP8",
             temperature=0.0,
-            api_key=api_key,
+            llama_api_key=api_key,
         )
         model_with_tools = model.bind_tools(tools)
         response = model_with_tools.invoke(messages, config=config)

@@ -125,27 +125,41 @@ def _lc_message_to_llama_message_param(
         content_payload = message.content
     elif isinstance(message, AIMessage):
         role = "assistant"
-        content_payload = message.content if message.content else ""
+        content_payload = message.content if message.content else None
         if message.tool_calls and len(message.tool_calls) > 0:
+            content_payload = None
             tool_calls = []
             for tc in message.tool_calls:
                 args_val = tc.get("args")
                 if isinstance(args_val, str):
                     try:
-                        args_dict = json.loads(args_val)
+                        json.loads(args_val)
+                        args_str = args_val
                     except Exception:
-                        args_dict = {"value": args_val}
+                        try:
+                            args_str = json.dumps({"value": args_val})
+                        except (TypeError, OverflowError):
+                            args_str = json.dumps({"value": repr(args_val)})
                 elif isinstance(args_val, dict):
-                    args_dict = args_val
+                    try:
+                        args_str = json.dumps(args_val)
+                    except (TypeError, OverflowError):
+                        args_str = json.dumps({k: repr(v) for k, v in args_val.items()})
+                elif args_val is None:
+                    args_str = json.dumps({})
                 else:
-                    args_dict = {"value": str(args_val)}
+                    try:
+                        args_str = json.dumps({"value": args_val})
+                    except (TypeError, OverflowError):
+                        args_str = json.dumps({"value": repr(args_val)})
+
                 tool_calls.append(
                     {
                         "id": tc["id"],
                         "type": "function",
                         "function": {
                             "name": tc["name"],
-                            "arguments": json.dumps(args_dict),
+                            "arguments": args_str,
                         },
                     }
                 )
@@ -164,7 +178,12 @@ def _lc_message_to_llama_message_param(
     elif isinstance(message, ToolMessage):
         role = "tool"
         if isinstance(message.content, (list, dict)):
-            content_payload = json.dumps(message.content)
+            try:
+                content_payload = json.dumps(message.content)
+            except (TypeError, OverflowError):
+                content_payload = str(message.content)
+        elif isinstance(message.content, str):
+            content_payload = message.content
         else:
             content_payload = str(message.content)
         tool_call_id = message.tool_call_id
@@ -181,8 +200,8 @@ def _lc_message_to_llama_message_param(
     if tool_call_id:
         msg_dict["tool_call_id"] = tool_call_id
 
-    if role == "assistant" and tool_calls:
-        msg_dict["content"] = ""
+    if role == "assistant" and msg_dict.get("content") is None and msg_dict.get("tool_calls"):
+        del msg_dict["content"]
 
     if role == "assistant" and stop_reason:
         msg_dict["stop_reason"] = stop_reason
@@ -528,7 +547,7 @@ def _convert_parse_method_tool(lc_tool: Any) -> dict:
         schema = getattr(lc_tool, "schema", None)
         parameters = (
             schema()
-            if callable(schema)
+            if schema and callable(schema)  # Check if schema exists before calling
             else (
                 schema
                 if isinstance(schema, dict)
@@ -606,8 +625,8 @@ def _lc_tool_to_llama_tool_param(
     # Check for direct Llama API dict format first (common for bind_tools with pre-formatted dicts)
     if (
         isinstance(lc_tool, dict)
-        and "function" in lc_tool
-        and isinstance(lc_tool["function"], dict)
+        and lc_tool.get("type") == "function"  # Check type field first
+        and isinstance(lc_tool.get("function"), dict) # Then check function field
     ):
         try:
             return _convert_dict_tool(lc_tool)  # type: ignore

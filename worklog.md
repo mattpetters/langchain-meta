@@ -190,3 +190,46 @@ This work enables more reliable tool usage with LangGraph and other LangChain co
 - All integration tests pass, confirming production readiness.
 
 ---
+
+**Session Date:** 2025-05-14 (Standard Tests Integration)
+
+**Goal:** Pass LangChain standard integration tests (`tests/integration/test_chat_models.py`).
+
+**Progress:**
+
+*   Fixed `AttributeError: 'CreateChatCompletionResponseStreamChunk' object has no attribute 'message'` in async streaming (`_astream`) by correctly accessing Llama client chunk structure (`chunk.completion_message`).
+*   Marked `test_tool_choice` as `xfail` due to lack of API support for the `tool_choice` parameter.
+
+**Outstanding Issues & Next Steps:**
+
+1.  **Tool Calling Streaming (`AssertionError: assert 0 == 1`):**
+    *   Tests: `test_tool_calling_async` (astream part), `test_tool_calling_with_no_arguments` (stream part).
+    *   Issue: The aggregated `AIMessageChunk` at the end of streaming still lacks the expected `tool_calls`.
+    *   Action: Review `_astream` and `_stream` aggregation logic for `ToolCallChunk` into the final `AIMessage.tool_calls`. The logic added to `_astream` for accumulating chunks might be flawed.
+
+2.  **Structured Output Metadata (`KeyError: 'ls_structured_output_format'`):**
+    *   Tests: `test_structured_output` (sync, async, pydantic, json_schema), `test_structured_output_async` (pydantic, json_schema).
+    *   Issue: The metadata injection attempted via `_get_invocation_params` into `params['options']` is not being picked up by the test callback handler.
+    *   Action: Re-evaluate how and when this metadata needs to be passed to the callback system for standard tests. Check how `_TestCallbackHandler` accesses options/metadata.
+
+3.  **Structured Output Failures (TypedDict/Optional):**
+    *   Tests: `test_structured_output[typeddict]` (sync: `AttributeError`), `test_structured_output_async[typeddict]` (`AttributeError`), `test_structured_output_optional_param` (`AssertionError`).
+    *   Issue: Model returns `None` instead of structured output for `TypedDict` schemas and schemas with optional parameters.
+    *   Action: Investigate how `with_structured_output` handles these schema types and how the Llama API responds when using `response_format=json_schema` with them.
+
+4.  **Structured Output Streaming (Pydantic v1):**
+    *   Test: `test_structured_output_pydantic_2_v1`.
+    *   Issue: `UnboundLocalError: cannot access local variable 'chunk'` suggests the stream loop yields no chunks.
+    *   Action: Investigate streaming specifically when using `response_format=json_schema` with Pydantic v1 schemas.
+
+5.  **General Streaming Issues:**
+    *   Tests: `test_stream`, `test_astream` (`AssertionError: assert 0 > 0`), `test_usage_metadata_streaming` (`AssertionError: assert None is not None`).
+    *   Issue: Basic streaming seems broken (no chunks yielded?) and usage metadata isn't aggregated/yielded.
+    *   Action: Review the core `_stream` and `_astream` logic, including handling of initial chunks and usage metadata aggregation.
+
+6.  **Tool Message History Format (`InternalServerError`):**
+    *   Test: `test_tool_message_histories_string_content`.
+    *   Issue: The specific message history format (AIMessage with empty content + ToolMessage with string content) causes a 500 error from the Llama API.
+    *   Action: Review `serialization.py` (`_lc_message_to_llama_message_param`) to ensure this message history format is serialized correctly according to Llama API requirements.
+
+---

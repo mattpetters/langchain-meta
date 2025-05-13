@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import datetime
 from unittest.mock import MagicMock, patch
+from typing import Type, Literal, Optional, List
 
 import pytest
 from langchain_core.messages import HumanMessage, AIMessage
@@ -40,6 +41,8 @@ from langchain_meta.chat_meta_llama.serialization import (
 
 # Import parse_malformed_args_string function from utils.py
 from langchain_meta.utils import parse_malformed_args_string
+
+from langchain_tests.unit_tests import ChatModelUnitTests
 
 
 # For tests that previously used _lc_tool_to_llama_tool_param and _normalize_tool_call
@@ -776,3 +779,25 @@ def test_normalize_tool_call_various_cases():
     assert norm["id"] == "id123"
     assert norm["name"] == "bar"
     assert norm["args"] == {"x": 1}
+
+
+class TestChatMetaLlamaUnit(ChatModelUnitTests):
+    @property
+    def chat_model_class(self) -> Type[ChatMetaLlama]:
+        return ChatMetaLlama
+
+    @property
+    def chat_model_params(self) -> dict:
+        # These should be parameters used to initialize your integration for testing
+        # For unit tests, we don't need real API keys.
+        # The model_name is provided to avoid relying on the default, making the test more explicit.
+        return {
+            "model_name": "Llama-3.3-8B-Instruct",  # Using a known valid model
+            "temperature": 0.7,
+            # llama_api_key and llama_api_url are not strictly needed for all unit tests
+            # as some might mock the client, but providing them if ChatMetaLlama
+            # initialization expects them or tries to create a client.
+            # Using placeholder values for unit tests.
+            "llama_api_key": "dummy_key_unit",
+            "llama_api_url": "http://localhost:1234/unit"
+        }
