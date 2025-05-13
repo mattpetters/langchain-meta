@@ -43,7 +43,11 @@ from pydantic import BaseModel
 
 # Assuming chat_models.py is in langchain_meta.chat_models
 # Adjust the import path if necessary based on your project structure.
-from .serialization import _lc_tool_to_llama_tool_param, _parse_textual_tool_args
+from .serialization import (
+    _lc_tool_to_llama_tool_param,
+    _parse_textual_tool_args,
+)  # Changed from ..chat_models
+from ..utils import parse_malformed_args_string  # Import from main utils
 
 logger = logging.getLogger(__name__)
 
