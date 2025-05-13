@@ -145,26 +145,6 @@ llm_with_tools = llm.bind_tools([get_weather])
 response = llm_with_tools.invoke("What's the weather in Seattle?")
 ```
 
-### LangGraph Serialization Support
-
-To solve serialization issues with LangGraph, `ChatMetaLlama` provides a built-in message serializer:
-
-```python
-from langchain_meta import ChatMetaLlama
-from langgraph.serde import register_type_serializer
-from langchain_core.messages import AIMessage
-
-# Register the serializer with LangGraph
-register_type_serializer(
-    AIMessage,
-    serialize_fn=ChatMetaLlama.get_message_serializer(),
-    deserialize_fn=lambda x: AIMessage(**x)
-)
-
-# Now your graph nodes can properly serialize AIMessage objects
-# See examples/langgraph_serialization.py for a complete example
-```
-
 ## Advanced Features
 
 - **Streaming Support**: Streaming implementation for both content and tool calls
