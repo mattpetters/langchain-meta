@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "langchain-meta"
-version = "0.3.9"
+version = "0.3.10"
 description = "An integration wrapper package connecting Meta's Llama API client and LangGraph. Implements ChatModel interface from LangChain."
 authors = ["Matt Petters <mcpetters@gmail.com>"]
 readme = "README.md"
