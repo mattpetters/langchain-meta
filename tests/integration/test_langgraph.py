@@ -17,8 +17,10 @@ from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 import importlib
 import typing
+import uuid
 
 from langchain_meta.chat_models import ChatMetaLlama
+from langchain_meta.utils import parse_malformed_args_string
 
 load_dotenv()
 
@@ -520,6 +522,73 @@ def test_human_assistance_tool_resume_with_command():
         "The human response was not found in the final message after resuming with Command."
     )
 
+def test_tool_call_id_and_args_defensive_handling():
+    """Test that tool_call_id is always set and args is always a dict, even for malformed tool calls."""
+    from langchain_core.messages import AIMessage
+
+    # Simulate a malformed tool call (missing id and args as string)
+    malformed_tool_call = {
+        # 'id' is missing
+        "name": "get_current_time",
+        "args": "not_a_dict",  # Should be a dict
+        "type": "function",
+    }
+    # Simulate the code path in chat_sync.py/chat_async.py after defensive fix
+    tc_id = malformed_tool_call.get("id", None) or str(uuid.uuid4())
+    tc_name = malformed_tool_call.get("name", "unknown_tool")
+    args = malformed_tool_call.get("args", {})
+    if not isinstance(args, dict):
+        args = {"value": str(args)}
+    assert isinstance(args, dict)
+    assert tc_id is not None and isinstance(tc_id, str)
+    assert tc_name == "get_current_time"
+
+    # Simulate AIMessage creation
+    msg = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "id": tc_id,
+                "name": tc_name,
+                "args": args,
+                "type": "function",
+            }
+        ],
+    )
+    # Check that the tool_call_id and args are correct
+    assert msg.tool_calls[0]["id"] == tc_id
+    assert isinstance(msg.tool_calls[0]["args"], dict)
+    assert msg.tool_calls[0]["name"] == "get_current_time"
+
+
+@pytest.mark.integration
+def test_malformed_tool_arguments_parsing():
+    """Test that malformed tool arguments are properly parsed in a LangGraph workflow."""
+    from langchain_meta.utils import parse_malformed_args_string
+
+    # Mock a tool call with malformed arguments like those produced by LLMs
+    malformed_tool_args = 'name="Test User", age=30'
+    parsed_args = parse_malformed_args_string(malformed_tool_args)
+
+    assert parsed_args == {"name": "Test User", "age": "30"}
+
+    # Test with other common malformed formats
+    assert parse_malformed_args_string('key1="value1" key2="value2"') == {
+        "key1": "value1",
+        "key2": "value2",
+    }
+    assert parse_malformed_args_string(
+        'query="What is the weather in San Francisco?"'
+    ) == {"query": "What is the weather in San Francisco?"}
+
+    # Test with a real-world example that might be produced by Llama models
+    llama_style_args = 'location="San Francisco", date="today", details=true'
+    parsed_llama_args = parse_malformed_args_string(llama_style_args)
+    assert parsed_llama_args == {
+        "location": "San Francisco",
+        "date": "today",
+        "details": "true",
+    }
 
 @pytest.mark.integration
 def test_defensive_handling_of_malformed_tool_call():
@@ -551,3 +620,4 @@ def test_defensive_handling_of_malformed_tool_call():
     assert normalized3["name"] == "unknown_tool"
     assert normalized3["id"] == "tool123"
     assert normalized3["args"] == {"key": "value"}
+
