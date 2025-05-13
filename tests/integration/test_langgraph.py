@@ -519,3 +519,35 @@ def test_human_assistance_tool_resume_with_command():
     assert found_human_response, (
         "The human response was not found in the final message after resuming with Command."
     )
+
+
+@pytest.mark.integration
+def test_defensive_handling_of_malformed_tool_call():
+    """Test that malformed tool calls (missing id or non-dict args) are handled defensively."""
+    from langchain_meta.chat_meta_llama.serialization import _normalize_tool_call
+
+    # Test case 1: Missing id, args is a string
+    malformed1 = {"name": "dummy_tool", "args": "not_a_dict"}
+    normalized1 = _normalize_tool_call(malformed1)
+    assert "id" in normalized1
+    assert isinstance(normalized1["id"], str)
+    assert len(normalized1["id"]) > 0  # ID should be a non-empty string
+    assert isinstance(normalized1["args"], dict)
+    assert normalized1["args"]["value"] == "not_a_dict"
+    assert normalized1["type"] == "function"
+
+    # Test case 2: Empty id, args is None
+    malformed2 = {"name": "dummy_tool", "id": "", "args": None}
+    normalized2 = _normalize_tool_call(malformed2)
+    assert "id" in normalized2
+    assert isinstance(normalized2["id"], str)
+    assert len(normalized2["id"]) > 0  # ID should be a non-empty string
+    assert isinstance(normalized2["args"], dict)
+    assert normalized2["args"] == {"value": "None"}
+
+    # Test case 3: Missing name, valid args
+    malformed3 = {"id": "tool123", "args": {"key": "value"}}
+    normalized3 = _normalize_tool_call(malformed3)
+    assert normalized3["name"] == "unknown_tool"
+    assert normalized3["id"] == "tool123"
+    assert normalized3["args"] == {"key": "value"}

@@ -129,16 +129,16 @@ def _lc_message_to_llama_message_param(
         if message.tool_calls and len(message.tool_calls) > 0:
             tool_calls = []
             for tc in message.tool_calls:
-                args_dict = {}
-                if isinstance(tc.get("args"), str):
+                args_val = tc.get("args")
+                if isinstance(args_val, str):
                     try:
-                        args_dict = json.loads(tc["args"])
-                    except json.JSONDecodeError:
-                        args_dict = {"value": tc["args"]}
-                elif isinstance(tc.get("args"), dict):
-                    args_dict = tc["args"]
+                        args_dict = json.loads(args_val)
+                    except Exception:
+                        args_dict = {"value": args_val}
+                elif isinstance(args_val, dict):
+                    args_dict = args_val
                 else:
-                    args_dict = {}
+                    args_dict = {"value": str(args_val)}
                 tool_calls.append(
                     {
                         "id": tc["id"],
@@ -649,32 +649,53 @@ def _lc_tool_to_llama_tool_param(
     return _create_minimal_tool(lc_tool)  # type: ignore
 
 
-def _normalize_tool_call(
-    tc: Dict[str, Any],
-) -> Dict[str, Any]:  # Made tc explicitly Dict
-    """Convert potentially complex tool call objects to simple dictionaries for Llama API."""
-    args = tc.get("args", {})
-    serialized_args: Dict[str, Any] = {}
+def _normalize_tool_call(tc: dict) -> dict:
+    """
+    Defensive normalization for tool call dicts:
+    - Ensures 'id' is a non-empty string (generates uuid if missing/empty)
+    - Ensures 'name' is a string (fallback to 'unknown_tool')
+    - Ensures 'args' is a dict (parses string as JSON, else wraps as {'value': ...})
+    - Always sets 'type' to 'function'
+    - Logs a warning for any repair
+    """
+    logger = logging.getLogger(__name__)
+    tool_call = dict(tc)  # shallow copy
 
-    if isinstance(args, dict):
-        for k, v in args.items():
-            if hasattr(v, "isoformat") and callable(getattr(v, "isoformat")):
-                serialized_args[k] = v.isoformat()
-            else:
-                try:
-                    json.dumps({k: v})
-                    serialized_args[k] = v
-                except (TypeError, OverflowError):
-                    serialized_args[k] = str(v)
-    else:  # If args is not a dict, convert it to a simple string value under a key like "value"
-        serialized_args = {"value": str(args)}
+    # ID
+    tool_call_id = tool_call.get("id")
+    if (
+        not tool_call_id
+        or not isinstance(tool_call_id, str)
+        or not tool_call_id.strip()
+    ):
+        tool_call_id = str(uuid.uuid4())
+        logger.warning(f"Tool call missing or invalid id. Generated: {tool_call_id}")
+    tool_call["id"] = tool_call_id
 
-    return {
-        "id": str(tc.get("id", str(uuid.uuid4()))),
-        "type": "function",  # Llama API tool calls are type "function"
-        "name": str(tc.get("name", "unknown_tool")),  # Ensure name is string
-        "args": serialized_args,
-    }
+    # Name
+    name = tool_call.get("name")
+    if not name or not isinstance(name, str):
+        logger.warning(f"Tool call missing or invalid name. Using 'unknown_tool'.")
+        name = "unknown_tool"
+    tool_call["name"] = name
+
+    # Args
+    args_val = tc.get("args")
+    if isinstance(args_val, str):
+        try:
+            args_dict = json.loads(args_val)
+        except Exception:
+            args_dict = {"value": args_val}
+    elif isinstance(args_val, dict):
+        args_dict = args_val
+    else:
+        args_dict = {"value": str(args_val)}
+    tool_call["args"] = args_dict
+
+    # Type
+    tool_call["type"] = "function"
+
+    return tool_call
 
 
 def _parse_textual_tool_args(args_str: Optional[str]) -> Dict[str, Any]:
