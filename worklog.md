@@ -272,3 +272,50 @@ The integration test suite now passes with:
 - Support structured output metadata correctly
 
 ---
+
+## 2024-12-05 Streaming Tool Call Fixes
+
+Implemented comprehensive improvements to make streaming tool calls work correctly in both sync and async modes:
+
+1. **Fixed Async Implementation**
+
+   - Added the missing `_aget_stream_results` method to properly handle response aggregation
+   - Fixed an indentation error in the async implementation that was causing syntax errors
+   - Corrected the return type of `_astream_with_aggregation_and_retries` to properly return a `ChatResult`
+
+2. **Enhanced Textual Tool Call Detection**
+
+   - Improved the regex pattern from `re.fullmatch()` to `re.search()` with a more flexible pattern
+   - Made the detection more robust by adding better defensive checks for tool names
+   - Added comprehensive logging to help with debugging
+
+3. **Tool Call Data Structure Consistency**
+
+   - Updated both sync and async implementations to use dictionaries with consistent structure
+   - Modified how tool calls are processed during streaming to match LangChain's expected format
+   - Improved tool argument parsing with better fallback handling
+
+4. **Comprehensive Test Coverage**
+   - Created dedicated unit tests for both structured and textual tool calls
+   - Added tests for multi-chunk tool call argument streaming
+   - Implemented proper mocking to verify correct handling without requiring API calls
+
+The code now correctly processes both structured and textual tool calls in both synchronous and asynchronous modes, allowing LangChain-Meta to properly integrate with LangGraph and other LangChain components for streaming applications.
+
+## Next Steps
+
+1. **Structured Output Improvements**
+
+   - Further enhance `with_structured_output` to better work with Meta's API capabilities
+   - Improve metadata extraction for LangSmith integration
+
+2. **Tool Calling Enhancements**
+
+   - Add support for the `tool_choice` parameter to control tool selection
+   - Implement more robust error handling for partial tool calls
+
+3. **Integration Test Expansion**
+   - Add more end-to-end tests with LangGraph workflows
+   - Test different tool formats and edge cases
+
+---

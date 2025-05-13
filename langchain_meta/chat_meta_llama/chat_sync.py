@@ -717,8 +717,14 @@ class SyncChatMetaLlamaMixin:
                     and prepared_llm_tools
                     and content_delta_str
                 ):
-                    match = re.fullmatch(
-                        r"\s*\[\s*([a-zA-Z0-9_]+)\s*(?:\(\s*(.*?)\s*\))?\s*\]\s*",
+                    # Log the content we're trying to match against for debugging
+                    logger.debug(
+                        f"Looking for textual tool call in content: '{content_delta_str}'"
+                    )
+
+                    # Use a simpler regex pattern that's more tolerant of spacing
+                    match = re.search(
+                        r"\[\s*([a-zA-Z0-9_]+)\s*(?:\(\s*(.*?)\s*\))?\s*\]",
                         content_delta_str,
                     )
                     if match:
@@ -727,14 +733,25 @@ class SyncChatMetaLlamaMixin:
                             match.group(2) if match.group(2) is not None else ""
                         )
 
-                        available_tool_names = [
-                            t["function"]["name"]
-                            for t in prepared_llm_tools
-                            if isinstance(t, dict)
-                            and "function" in t
-                            and "name" in t["function"]
-                        ]
+                        logger.debug(
+                            f"Found textual tool call match: name='{tool_name_from_text}', args='{args_str_from_text}'"
+                        )
 
+                        # Get the list of available tools, with better defensive checks
+                        available_tool_names = []
+                        if prepared_llm_tools:
+                            for t in prepared_llm_tools:
+                                if isinstance(t, dict) and "function" in t:
+                                    func_dict = t.get("function", {})
+                                    if (
+                                        isinstance(func_dict, dict)
+                                        and "name" in func_dict
+                                    ):
+                                        available_tool_names.append(func_dict["name"])
+
+                        logger.debug(f"Available tool names: {available_tool_names}")
+
+                        # If the matched tool name is one of our available tools, create a ToolCallChunk
                         if tool_name_from_text in available_tool_names:
                             logger.info(
                                 f"Detected textual tool call in stream: {tool_name_from_text}"
@@ -754,19 +771,25 @@ class SyncChatMetaLlamaMixin:
                                 }
                                 next_tool_call_chunk_index += 1
 
-                            lc_textual_tool_chunk = ToolCallChunk(
-                                name=tool_name_from_text,
-                                args=args_str_from_text,  # The full args string for this textual tool call
-                                id=textual_tool_id,
-                                index=aggregated_tool_calls_buffer[textual_tool_id][
+                            # For LangChain, we need to create a dictionary that looks like a ToolCallChunk
+                            # but with the right structure for AIMessageChunk.tool_call_chunks
+                            lc_textual_tool_dict = {
+                                "name": tool_name_from_text,
+                                "args": args_str_from_text,  # The full args string for this textual tool call
+                                "id": textual_tool_id,
+                                "index": aggregated_tool_calls_buffer[textual_tool_id][
                                     "index"
                                 ],
-                            )
-                            tool_call_chunks_for_lc.append(lc_textual_tool_chunk)
+                            }
+                            tool_call_chunks_for_lc.append(lc_textual_tool_dict)
                             content_delta_str = (
                                 ""  # Content is consumed by the textual tool call
                             )
                             generation_info["finish_reason"] = "tool_calls"
+                        else:
+                            logger.warning(
+                                f"Textual tool call '{tool_name_from_text}' found in content, but not in available tools: {available_tool_names}"
+                            )
 
                 # --- Metadata from the main chunk object ---
                 if hasattr(chunk, "model") and chunk.model:
