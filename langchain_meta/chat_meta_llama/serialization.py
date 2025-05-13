@@ -163,14 +163,7 @@ def _lc_message_to_llama_message_param(
                         },
                     }
                 )
-            if (
-                hasattr(message, "generation_info")
-                and message.generation_info
-                and "finish_reason" in message.generation_info
-            ):
-                if message.generation_info["finish_reason"] == "tool_calls":
-                    stop_reason = "tool_calls"
-            elif tool_calls:
+            if tool_calls:
                 stop_reason = "tool_calls"
     elif isinstance(message, SystemMessage):
         role = "system"
@@ -405,7 +398,6 @@ def _convert_pydantic_class_tool(
             "name": name,
             "description": description,
             "parameters": llama_parameters,
-            "strict": True,
         },
     }
 
@@ -544,20 +536,18 @@ def _convert_structured_tool(
         "name": name,
         "description": description,
         "parameters": llama_parameters,
-        "strict": True,
     }
-    # We removed additionalProperties earlier, ensure parameters itself is not empty for valid API call if no properties.
-    # The Llama API examples show parameters: {} when no params, so ensure it's at least an empty dict.
-    if not llama_parameters.get("properties") and not llama_parameters.get("required"):
-        function_def[
-            "parameters"
-        ] = {}  # Ensure parameters is {} if no props/required, not just containing additionalProperties:false
-    elif "properties" not in llama_parameters:  # if only required is present
-        llama_parameters[
-            "properties"
-        ] = {}  # Llama might expect properties key even if empty if other keys like required are present
-        function_def["parameters"] = llama_parameters
-
+    # Ensure parameters is always a valid JSON Schema object
+    if not isinstance(function_def["parameters"], dict):
+        function_def["parameters"] = {"type": "object", "properties": {}}
+    if "type" not in function_def["parameters"]:
+        function_def["parameters"]["type"] = "object"
+    if "properties" not in function_def["parameters"]:
+        function_def["parameters"]["properties"] = {}
+    # Remove any extra keys (like 'strict')
+    for key in list(function_def.keys()):
+        if key not in ("name", "description", "parameters"):
+            del function_def[key]
     return {"type": "function", "function": function_def}
 
 
@@ -588,7 +578,6 @@ def _convert_parse_method_tool(lc_tool: Any) -> dict:
                 "name": name,
                 "description": description,
                 "parameters": parameters,
-                "strict": True,
             },
         }
     raise ValueError("Not a parse-method tool or schema extraction failed")
@@ -620,7 +609,6 @@ def _convert_route_schema_tool(lc_tool: Any) -> dict:
                     "properties": {"next": {"type": "string", "enum": enum_values}},
                     "required": ["next"],
                 },
-                "strict": True,  # Added strict here as well
             },
         }
     raise ValueError("Not a RouteSchema tool by name convention")
@@ -639,7 +627,6 @@ def _create_minimal_tool(lc_tool: Any) -> dict:
             "name": name,
             "description": description,
             "parameters": parameters,
-            "strict": True,
         },
     }
 

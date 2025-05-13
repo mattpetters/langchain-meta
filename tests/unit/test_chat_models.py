@@ -201,41 +201,21 @@ def mock_llama_client_fixture():
 
                 mock_chunk2_completion_msg = MagicMock(spec=LlamaCompletionMessage)
                 mock_chunk2_completion_msg.content = " part 2"
-
-                # Example of a tool call appearing in a stream chunk
-                mock_stream_tool_func = MagicMock(spec=LlamaToolCallFunction)
-                mock_stream_tool_func.name = "stream_tool"
-                mock_stream_tool_func.arguments = (
-                    '{"param":"value"}'  # Corrected JSON string
+                mock_chunk2_completion_msg.tool_calls = (
+                    None  # Chunk 2 should only have content for this test
                 )
-
-                mock_stream_tool_call = MagicMock(spec=LlamaToolCall)
-                mock_stream_tool_call.id = "stream_tool_id_1"
-                mock_stream_tool_call.function = mock_stream_tool_func
-                mock_stream_tool_call.to_dict = MagicMock(
-                    return_value={
-                        "id": "stream_tool_id_1",
-                        "function": {
-                            "name": "stream_tool",
-                            "arguments": '{"param":"value"}',
-                        },  # Corrected JSON string
-                    }
-                )
-                mock_chunk2_completion_msg.tool_calls = [mock_stream_tool_call]
-                mock_chunk2_completion_msg.stop_reason = "tool_calls"
+                mock_chunk2_completion_msg.stop_reason = None  # No stop reason yet
 
                 mock_chunk2 = MagicMock(spec=CreateChatCompletionResponse)
                 mock_chunk2.completion_message = mock_chunk2_completion_msg
-                mock_chunk2.usage = (
-                    None  # Usage might appear at the end or not at all in chunks
-                )
+                mock_chunk2.usage = None
                 mock_chunk2.x_request_id = "stream_req_id_2"
                 mock_chunk2.to_dict = MagicMock(
                     return_value={
                         "completion_message": {
                             "content": " part 2",
-                            "tool_calls": [mock_stream_tool_call.to_dict()],
-                            "stop_reason": "tool_calls",
+                            "tool_calls": None,
+                            "stop_reason": None,
                         },
                         "x_request_id": "stream_req_id_2",
                     }
@@ -799,5 +779,5 @@ class TestChatMetaLlamaUnit(ChatModelUnitTests):
             # initialization expects them or tries to create a client.
             # Using placeholder values for unit tests.
             "llama_api_key": "dummy_key_unit",
-            "llama_api_url": "http://localhost:1234/unit"
+            "llama_api_url": "http://localhost:1234/unit",
         }

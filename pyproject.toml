@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "langchain-meta"
-version = "0.3.12"
+version = "0.4.0-alpha.1"
 description = "An integration wrapper package connecting Meta's Llama API client and LangGraph. Implements ChatModel interface from LangChain."
 authors = ["Matt Petters <mcpetters@gmail.com>"]
 readme = "README.md"
@@ -63,14 +63,23 @@ optional = true
 optional = true
 
 [tool.poetry.group.dev.dependencies]
-pytest = "7.4.4"
+black = "^24.4.2"
+mypy = "^1.15.0"
+ruff = "^0.7.0"
+pytest = "^7.4.4"
+pytest-asyncio = "^0.23.7"
+syrupy = "^4.9.1"
+llama-api-client = "^0.1.0"
+langchain-core = "^0.3.59"
+langchain-tavily = "^0.1.6"
+langgraph = "^0.4.3"
+langchain-tests = "==0.3.19"
 
 [tool.poetry.group.test.dependencies]
 pytest = "^7.4.3"
 pytest-asyncio = "^0.23.2"
 pytest-socket = "^0.7.0"
 pytest-watcher = "^0.3.4"
-langchain-tests = "^0.3.19"
 
 [tool.poetry.group.codespell.dependencies]
 codespell = "^2.2.6"
@@ -78,7 +87,7 @@ codespell = "^2.2.6"
 [tool.poetry.group.test_integration.dependencies]
 
 [tool.poetry.group.lint.dependencies]
-ruff = "^0.5"
+ruff = "^0.7.0"
 
 [tool.poetry.group.typing.dependencies]
 mypy = "^1.10"

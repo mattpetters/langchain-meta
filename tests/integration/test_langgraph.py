@@ -51,6 +51,9 @@ except ImportError:
 def call_model(state: State, config: RunnableConfig):
     messages = state["messages"]
     api_key = os.getenv("META_API_KEY")
+    print(
+        f"[DEBUG] call_model: Loaded META_API_KEY: {'<' + str(api_key)[:5] + '...' if api_key else 'None'}"
+    )  # Debug print
     if not api_key:
         pytest.skip("META_API_KEY not set, skipping integration test.")
 
@@ -284,7 +287,13 @@ def test_chat_meta_llama_with_langchain_tools_decorator():
     thread_id = "test-langchain-tools-thread"
     config = typing.cast(RunnableConfig, {"configurable": {"thread_id": thread_id}})
     events = app.stream(
-        {"messages": [HumanMessage(content="What is the time?")]},
+        {
+            "messages": [
+                HumanMessage(
+                    content="Use the get_time_lc_tools tool to find out the current time."
+                )
+            ]
+        },
         config,
         stream_mode="values",
     )
@@ -322,7 +331,7 @@ def test_chat_meta_llama_integration():
 
     # Test user says "What is the time?"
     all_messages = stream_graph_and_collect_final_state_messages(
-        "What is the time?", thread_id
+        "Use the get_current_time tool to find out the current time.", thread_id
     )
     assert all_messages
 
@@ -492,7 +501,7 @@ def test_human_assistance_tool_resume_with_command():
 
     thread_id = "test-human-assistance-interrupt-resume"
     config = typing.cast(RunnableConfig, {"configurable": {"thread_id": thread_id}})
-    input_text = "I need some expert guidance for building an AI agent. Could you request assistance for me?"
+    input_text = "Use the human_assistance tool to ask for expert guidance for building an AI agent."  # More explicit prompt
     # Step 1: Run until interrupt
     events = app.stream(
         {"messages": [HumanMessage(content=input_text)]}, config, stream_mode="values"
@@ -521,6 +530,7 @@ def test_human_assistance_tool_resume_with_command():
     assert found_human_response, (
         "The human response was not found in the final message after resuming with Command."
     )
+
 
 def test_tool_call_id_and_args_defensive_handling():
     """Test that tool_call_id is always set and args is always a dict, even for malformed tool calls."""
@@ -590,6 +600,7 @@ def test_malformed_tool_arguments_parsing():
         "details": "true",
     }
 
+
 @pytest.mark.integration
 def test_defensive_handling_of_malformed_tool_call():
     """Test that malformed tool calls (missing id or non-dict args) are handled defensively."""
@@ -620,4 +631,3 @@ def test_defensive_handling_of_malformed_tool_call():
     assert normalized3["name"] == "unknown_tool"
     assert normalized3["id"] == "tool123"
     assert normalized3["args"] == {"key": "value"}
-

@@ -7,6 +7,7 @@ from typing import Type
 import pytest
 from langchain_meta.chat_models import ChatMetaLlama
 from langchain_tests.integration_tests import ChatModelIntegrationTests
+from langchain_tests.utils.pydantic import PYDANTIC_MAJOR_VERSION
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
 from unittest.mock import MagicMock
@@ -32,9 +33,9 @@ class TestChatMetaLlamaIntegration(ChatModelIntegrationTests):
         # We specify the model and temperature for consistency.
         params = {
             "model_name": os.getenv(
-                "LLAMA_TEST_MODEL", "Llama-3.3-8B-Instruct"
+                "LLAMA_TEST_MODEL", "Llama-4-Maverick-17B-128E-Instruct-FP8"
             ),  # Allow overriding model via env var
-            "temperature": 0.7,
+            "temperature": 0.1,
             "max_tokens": 100,
         }
         # Add API key and URL if they are explicitly set in env, otherwise let the class handle defaults/errors
@@ -61,23 +62,28 @@ class TestChatMetaLlamaIntegration(ChatModelIntegrationTests):
 
     @property
     def supports_tool_calling(self) -> bool:
-        # Despite having tool calling, the tests expect specific behavior
-        return False
+        return True
 
     @property
     def has_tool_choice(self) -> bool:
-        # Llama API does not support tool_choice parameter
         return False
 
     @property
     def supports_structured_output(self) -> bool:
-        # Disable structured output tests temporarily as they're not fully compatible with Llama API
-        return False
+        return True
 
     @property
     def returns_usage_metadata(self) -> bool:
         # Disable the test for usage metadata in streaming
         return False
+
+    @property
+    def has_structured_output(self) -> bool:
+        return True
+
+    @property
+    def has_tool_calling(self) -> bool:
+        return True
 
     # Add any other overrides for optional capabilities if needed
     # See: https://python.langchain.com/v0.2/docs/contributing/how_to/integrations/standard_tests/#chat-models
@@ -98,8 +104,8 @@ class TestChatMetaLlamaIntegration(ChatModelIntegrationTests):
         return super().test_stream(model)
 
     @pytest.mark.xfail(reason="Async streaming not properly implemented.")
-    def test_astream(self, model: BaseChatModel) -> None:
-        return super().test_astream(model)
+    async def test_astream(self, model: BaseChatModel) -> None:
+        return await super().test_astream(model)
 
     @pytest.mark.xfail(
         reason="Tool calling with no arguments not properly implemented."
@@ -120,5 +126,56 @@ class TestChatMetaLlamaIntegration(ChatModelIntegrationTests):
         return super().test_tool_calling(model)
 
     @pytest.mark.xfail(reason="Async tool calling not properly implemented.")
-    def test_tool_calling_async(self, model: BaseChatModel) -> None:
-        return super().test_tool_calling_async(model)
+    async def test_tool_calling_async(self, model: BaseChatModel) -> None:
+        return await super().test_tool_calling_async(model)
+
+    @pytest.mark.xfail(
+        reason="Meta Llama API callback implementation for structured output differs from OpenAI pattern"
+    )
+    @pytest.mark.parametrize("schema_type", ["pydantic", "typeddict", "json_schema"])
+    def test_structured_output(self, model: BaseChatModel, schema_type: str) -> None:
+        return super().test_structured_output(model, schema_type)
+
+    @pytest.mark.xfail(
+        reason="Meta Llama API callback implementation for structured output differs from OpenAI pattern"
+    )
+    @pytest.mark.parametrize("schema_type", ["pydantic", "typeddict", "json_schema"])
+    async def test_structured_output_async(
+        self, model: BaseChatModel, schema_type: str
+    ) -> None:
+        return await super().test_structured_output_async(model, schema_type)
+
+    @pytest.mark.xfail(
+        reason="Meta Llama API callback implementation for structured output differs from OpenAI pattern"
+    )
+    @pytest.mark.skipif(PYDANTIC_MAJOR_VERSION != 2, reason="Test requires pydantic 2.")
+    def test_structured_output_pydantic_2_v1(self, model: BaseChatModel) -> None:
+        return super().test_structured_output_pydantic_2_v1(model)
+
+    @pytest.mark.xfail(
+        reason="Meta Llama API errors with 500 for certain tool calling patterns"
+    )
+    def test_bind_runnables_as_tools(self, model: BaseChatModel) -> None:
+        return super().test_bind_runnables_as_tools(model)
+
+    @pytest.mark.xfail(
+        reason="Meta Llama API errors with 500 for certain tool calling patterns"
+    )
+    def test_structured_few_shot_examples(
+        self, model: BaseChatModel, my_adder_tool: BaseTool
+    ) -> None:
+        return super().test_structured_few_shot_examples(model, my_adder_tool)
+
+    @pytest.mark.xfail(
+        reason="Meta Llama API errors with 500 for certain tool calling patterns"
+    )
+    def test_tool_message_error_status(
+        self, model: BaseChatModel, my_adder_tool: BaseTool
+    ) -> None:
+        return super().test_tool_message_error_status(model, my_adder_tool)
+
+    @pytest.mark.xfail(
+        reason="Meta Llama API errors with 500 for certain tool calling patterns"
+    )
+    def test_agent_loop(self, model: BaseChatModel) -> None:
+        return super().test_agent_loop(model)

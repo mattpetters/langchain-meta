@@ -8,3 +8,4 @@ Before creating files, search to see if they already exist or there's a better p
 When encountering package errors/incorrect imports for libraries, please always use @Web tool / search the web immediately to not waste time guessing on outdated info or APIs.
 Always be aware of what version you're working with when looking up documentation or referencing materials.
 Avoid using Pydantic v1 except in legacy support cases, it is deprecated. Always prefer to use Pydantic v2
+Whenever finishing a big change, update [worklog.md](mdc:worklog.md) with a summary to persist and inform future sessions

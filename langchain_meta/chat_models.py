@@ -75,6 +75,8 @@ from pydantic import (
     ValidationInfo,
     field_validator,
 )
+from pydantic.v1 import BaseModel as BaseModelV1  # Import Pydantic V1 BaseModel
+from typing_extensions import Literal, Type, get_type_hints
 
 # Import the mixin
 from langchain_meta.chat_meta_llama.chat_async import AsyncChatMetaLlamaMixin
@@ -82,6 +84,7 @@ from langchain_meta.chat_meta_llama.chat_async import AsyncChatMetaLlamaMixin
 from .chat_meta_llama.chat_sync import SyncChatMetaLlamaMixin
 from .chat_meta_llama.serialization import (
     _lc_message_to_llama_message_param,
+    _lc_tool_to_llama_tool_param,
 )
 
 logger = logging.getLogger(__name__)
@@ -172,7 +175,7 @@ class ChatMetaLlama(SyncChatMetaLlamaMixin, AsyncChatMetaLlamaMixin, BaseChatMod
 
     # Ensure Pydantic handles the default value if model_name is not provided.
     # The field_validator can then focus on other forms of validation if needed.
-    model_name: Optional[str] = Field(default=LLAMA_DEFAULT_MODEL_NAME, alias="model")
+    model_name: Optional[str] = Field(default=LLAMA_DEFAULT_MODEL_NAME)
 
     # Optional parameters for the Llama API, with LangChain common names where applicable
     temperature: Optional[float] = Field(default=None)  # Added default
@@ -210,60 +213,52 @@ class ChatMetaLlama(SyncChatMetaLlamaMixin, AsyncChatMetaLlamaMixin, BaseChatMod
 
     def __init__(
         self,
-        *,  # Make all args keyword-only
+        *,
         model_name: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         repetition_penalty: Optional[float] = None,
         llama_api_key: Optional[str] = None,
         llama_api_url: Optional[str] = None,
-        stop: Optional[List[str]] = None,  # Added stop param
+        stop: Optional[List[str]] = None,
         client: Optional[LlamaAPIClient] = None,
         async_client: Optional[AsyncLlamaAPIClient] = None,
         **kwargs: Any,
     ):
-        # Separate known Llama API params from other kwargs that might be intended for model_kwargs
-        init_kwargs = {}
-        remaining_kwargs = {}
-        known_fields = self.model_fields.keys()
+        # Collect all relevant args for super().__init__
+        init_args = {
+            "model_name": model_name,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "repetition_penalty": repetition_penalty,
+            "llama_api_key": llama_api_key,  # Let Pydantic handle SecretStr
+            "llama_api_url": llama_api_url,
+            "stop": stop,
+            **kwargs,  # Pass remaining kwargs as well
+        }
 
-        for key, value in kwargs.items():
-            if key in known_fields:
-                init_kwargs[key] = value
-            else:
-                remaining_kwargs[key] = value
+        # Filter out None values that are not meant to override Pydantic defaults
+        # Only include args that were actually provided (not None)
+        filtered_init_args = {k: v for k, v in init_args.items() if v is not None}
 
-        # Always pop max_tokens from remaining_kwargs before passing to super to avoid double-passing if it was in **kwargs
-        # The direct max_tokens arg is handled by Pydantic field itself.
-        if max_tokens is not None and "max_tokens" in remaining_kwargs:
-            logger.warning(
-                "'max_tokens' was passed both as a direct argument and in **kwargs. Using direct argument."
-            )
-            remaining_kwargs.pop("max_tokens", None)
-        elif (
-            max_tokens is None and "max_tokens" in remaining_kwargs
-        ):  # max_tokens is in kwargs but not as direct arg
-            # Let Pydantic handle it if it's an alias, or it will go into model_kwargs if not a field
-            pass  # Don't pop here, let super().__init__ or model_kwargs catch it
+        # Call super().__init__ with the arguments that were actually provided.
+        # Pydantic will use Field defaults for arguments not present in filtered_init_args.
+        super().__init__(**filtered_init_args)
 
-        super().__init__(
-            **init_kwargs,  # Pass known fields from original kwargs
-        )
-        # Initialize model_kwargs with any remaining (unconsumed) keyword arguments
-        # This ensures that if BaseChatModel also has a model_kwargs, ours takes precedence
-        # or that we initialize it if BaseChatModel doesn't.
-        # We also add any kwargs that were not model fields of ChatMetaLlama
-        current_model_kwargs = getattr(
-            self, "model_kwargs", {}
-        )  # Get if super already set it
-        if not isinstance(current_model_kwargs, dict):  # Ensure it's a dict
-            current_model_kwargs = {}
-        current_model_kwargs.update(remaining_kwargs)  # Add our remaining kwargs
-        self.model_kwargs = current_model_kwargs
+        # Handle model_kwargs *after* super init
+        # Any remaining kwargs not assigned to fields by Pydantic are stored here.
+        # Note: Pydantic v2 usually handles extra kwargs based on model_config['extra']
+        # We might need to refine how remaining_kwargs are identified if using strict models.
+        self.model_kwargs = {
+            k: v for k, v in kwargs.items() if k not in self.model_fields
+        }
 
+        # Assign explicitly passed clients (will override initialization if provided)
         self._client = client
         self._async_client = async_client
 
+        # Ensure clients are initialized if not provided
+        # This needs the final values of llama_api_key and llama_api_url set by super init
         self._ensure_client_initialized()
 
     @field_validator("model_name", mode="before")
@@ -383,17 +378,22 @@ class ChatMetaLlama(SyncChatMetaLlamaMixin, AsyncChatMetaLlamaMixin, BaseChatMod
     def _prepare_api_params(
         self,
         messages: List[BaseMessage],
-        tools: Optional[List[completion_create_params.Tool]] = None,
+        # Remove tools from direct args, handle via kwargs from bind_tools
+        # tools: Optional[List[completion_create_params.Tool]] = None,
         stop: Optional[List[str]] = None,
         stream: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Prepares API parameters for a chat completion request."""
+        logger.debug(f"_prepare_api_params received kwargs: {kwargs}")  # Log all kwargs
+        logger.debug(f"_prepare_api_params: tools in kwargs: {kwargs.get('tools')}")
+        logger.debug(
+            f"_prepare_api_params: tool_choice in kwargs: {kwargs.get('tool_choice')}"
+        )
+
         api_params: Dict[str, Any] = {
             "model": self.model_name,
-            "messages": [
-                _lc_message_to_llama_message_param(m) for m in messages
-            ],  # Convert messages properly
+            "messages": [_lc_message_to_llama_message_param(m) for m in messages],
             "stream": stream,
         }
 
@@ -407,62 +407,89 @@ class ChatMetaLlama(SyncChatMetaLlamaMixin, AsyncChatMetaLlamaMixin, BaseChatMod
         for key in ["temperature", "repetition_penalty", "top_p", "top_k", "user"]:
             if key in kwargs:
                 api_param_name = key
-                # Check if the parameter is generally supported by the ChatMetaLlama class
-                # before adding it to API params. Note: This still relies on SUPPORTED_PARAMS
-                # which includes max_completion_tokens, but we are manually excluding it here.
                 if api_param_name in self.SUPPORTED_PARAMS:
                     api_params[api_param_name] = kwargs.pop(key)
 
-        # Handle max_tokens (alias max_completion_tokens for Llama API)
-        # Prefer max_tokens from direct call (via kwargs) > self.max_tokens
+        # Handle max_tokens
         max_tokens_val = kwargs.pop("max_tokens", self.max_tokens)
         if max_tokens_val is not None:
             api_params["max_completion_tokens"] = max_tokens_val
 
-        # Add tools if provided
-        if tools:
-            api_params["tools"] = tools
-            # If tools are present and no specific tool_choice is given, set to "auto"
-            # to encourage the model to use the tools.
-            if (
-                "tool_choice" not in api_params
-                and kwargs.get("tool_choice", None) is None
-            ):
-                api_params["tool_choice"] = "auto"
-                logger.debug(
-                    "Set tool_choice='auto' as tools are present and no specific choice was made."
-                )
+        # Process tools from kwargs (passed by bind_tools)
+        tools_list = kwargs.pop("tools", None)
+        llama_tools = None
+        if tools_list:
+            try:
+                llama_tools = [
+                    _lc_tool_to_llama_tool_param(tool) for tool in tools_list
+                ]
+                api_params["tools"] = llama_tools
+            except Exception as e:
+                logger.error(f"Error converting tools for Llama API: {e}")
+                # Decide if we should proceed without tools or raise
 
-        # Stop sequence is not directly supported by the client's create method, so we don't add it here.
+        # Process tool_choice from kwargs
+        tool_choice = kwargs.pop("tool_choice", None)
+        if tool_choice:
+            # Check if it's already Llama format, else adapt if simple string
+            if isinstance(tool_choice, str) and tool_choice in [
+                "auto",
+                "none",
+                "any",
+                "required",
+            ]:
+                api_params["tool_choice"] = tool_choice
+            elif isinstance(tool_choice, dict):
+                api_params["tool_choice"] = tool_choice  # Assume Llama format dict
+            else:
+                logger.warning(
+                    f"Unsupported tool_choice format: {tool_choice}. Ignoring."
+                )
+        elif (
+            llama_tools and "tool_choice" not in api_params
+        ):  # Check if tool_choice wasn't already set
+            # If tools are present and no specific tool_choice is given, set to "auto"
+            api_params["tool_choice"] = "auto"
+            logger.debug(
+                "Set tool_choice='auto' as tools are present and no specific choice was made."
+            )
+
+        # Stop sequence handling
         if stop:
             logger.warning(
                 "'stop' sequences were provided, but are not directly supported by the Llama API client's create method and will be ignored."
             )
 
-        # Add response_format if provided (for structured output)
+        # Add response_format if provided
         if "response_format" in kwargs:
-            # Meta uses response_format parameter for json_schema output
             api_params["response_format"] = kwargs.pop("response_format")
 
-        # Check for any remaining kwargs that are not supported and warn
-        # Add max_tokens explicitly to the list of ignored keys here since it's a known unsupported param for the client
+        # Warn about remaining unsupported kwargs
         IGNORED_PARAMS = [
             "client",
             "async_client",
             "run_manager",
             "callbacks",
-            "max_tokens",
-            "system_prompt",  # Handled via messages, not directly
+            "max_tokens",  # Handled above
+            "system_prompt",
+            "tools",  # Handled above
+            "tool_choice",  # Handled above
         ]
         for key in kwargs.keys():
-            # Also check if the key is in SUPPORTED_PARAMS but is one we are explicitly excluding for this client version
             if key not in self.SUPPORTED_PARAMS and key not in IGNORED_PARAMS:
                 logger.warning(
                     f"Unsupported parameter passed to API call: {key}. It will be ignored."
                 )
 
-        # Ensure tool_choice is never sent to the Llama API endpoint
-        api_params.pop("tool_choice", None)
+        # REMOVED: Ensure tool_choice is never sent to the Llama API endpoint
+        api_params.pop("tool_choice", None)  # Remove unconditionally for now
+
+        # Log the final API params being sent (excluding messages for brevity if needed)
+        log_params = {k: v for k, v in api_params.items() if k != "messages"}
+        logger.debug(f"Final API params prepared: {log_params}")
+        if "messages" in api_params:
+            logger.debug(f"Messages count: {len(api_params['messages'])}")
+            # Optionally log message roles/content summary if needed
 
         return api_params
 
@@ -579,8 +606,8 @@ class ChatMetaLlama(SyncChatMetaLlamaMixin, AsyncChatMetaLlamaMixin, BaseChatMod
         self,
         schema: Union[Dict, Type[BaseModel]],
         *,
-        # Default to json_schema as it seems more aligned with Meta API intent and standard tests
-        method: Literal["function_calling", "json_schema"] = "json_schema",
+        # Allow json_mode as an alias for json_schema
+        method: Literal["function_calling", "json_schema", "json_mode"] = "json_schema",
         include_raw: bool = False,
         **kwargs: Any,
     ) -> Runnable[LanguageModelInput, Union[Dict, BaseModel]]:
@@ -612,11 +639,21 @@ class ChatMetaLlama(SyncChatMetaLlamaMixin, AsyncChatMetaLlamaMixin, BaseChatMod
             if schema.get("function"):
                 schema_name = schema["function"].get("name")
                 schema_dict = schema["function"].get("parameters", {})
-        elif isinstance(schema, type) and issubclass(schema, BaseModel):
-            # Pydantic model
-            is_pydantic = True
+        elif (
+            isinstance(schema, type)
+            and (
+                issubclass(schema, BaseModel) or issubclass(schema, BaseModelV1)
+            )  # Check for V1 or V2
+        ):
+            # Pydantic model (V1 or V2)
+            is_pydantic = True  # Mark that a Pydantic model was processed
             schema_name = schema.__name__
-            schema_dict = model_to_json_schema(schema)
+            if issubclass(schema, BaseModelV1):
+                # Pydantic V1: Use .schema() to get the schema dictionary
+                schema_dict = schema.schema()
+            else:
+                # Pydantic V2: Use model_to_json_schema helper or schema.model_json_schema()
+                schema_dict = model_to_json_schema(schema)
         elif (
             isinstance(schema, type)
             and hasattr(schema, "__annotations__")
@@ -650,7 +687,8 @@ class ChatMetaLlama(SyncChatMetaLlamaMixin, AsyncChatMetaLlamaMixin, BaseChatMod
             )
 
         # Use json_schema mode by default or if explicitly requested
-        if method == "json_schema":
+        # Treat json_mode the same as json_schema for Meta Llama API
+        if method in ("json_schema", "json_mode"):
             # Construct the response_format parameter for Meta Llama API
             response_format = {
                 "type": "json_schema",
