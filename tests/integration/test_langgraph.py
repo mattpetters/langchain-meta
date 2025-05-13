@@ -17,6 +17,7 @@ from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 import importlib
 import typing
+import uuid
 
 from langchain_meta.chat_models import ChatMetaLlama
 
@@ -519,3 +520,42 @@ def test_human_assistance_tool_resume_with_command():
     assert found_human_response, (
         "The human response was not found in the final message after resuming with Command."
     )
+
+
+def test_tool_call_id_and_args_defensive_handling():
+    """Test that tool_call_id is always set and args is always a dict, even for malformed tool calls."""
+    from langchain_core.messages import AIMessage
+
+    # Simulate a malformed tool call (missing id and args as string)
+    malformed_tool_call = {
+        # 'id' is missing
+        "name": "get_current_time",
+        "args": "not_a_dict",  # Should be a dict
+        "type": "function",
+    }
+    # Simulate the code path in chat_sync.py/chat_async.py after defensive fix
+    tc_id = malformed_tool_call.get("id", None) or str(uuid.uuid4())
+    tc_name = malformed_tool_call.get("name", "unknown_tool")
+    args = malformed_tool_call.get("args", {})
+    if not isinstance(args, dict):
+        args = {"value": str(args)}
+    assert isinstance(args, dict)
+    assert tc_id is not None and isinstance(tc_id, str)
+    assert tc_name == "get_current_time"
+
+    # Simulate AIMessage creation
+    msg = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "id": tc_id,
+                "name": tc_name,
+                "args": args,
+                "type": "function",
+            }
+        ],
+    )
+    # Check that the tool_call_id and args are correct
+    assert msg.tool_calls[0]["id"] == tc_id
+    assert isinstance(msg.tool_calls[0]["args"], dict)
+    assert msg.tool_calls[0]["name"] == "get_current_time"

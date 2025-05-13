@@ -238,7 +238,9 @@ class AsyncChatMetaLlamaMixin:
         if result_msg and hasattr(result_msg, "tool_calls") and result_msg.tool_calls:
             processed_tool_calls: List[Dict] = []
             for idx, tc in enumerate(result_msg.tool_calls):
-                tc_id = getattr(tc, "id", f"llama_tc_{idx}")
+                tc_id = (
+                    getattr(tc, "id", None) or f"llama_tc_{idx}" or str(uuid.uuid4())
+                )
                 tc_func = tc.function if hasattr(tc, "function") else None
                 tc_name = getattr(tc_func, "name", None) if tc_func else None
                 tc_args_str = getattr(tc_func, "arguments", "") if tc_func else ""
@@ -262,12 +264,18 @@ class AsyncChatMetaLlamaMixin:
                         f"Unexpected error processing tool call arguments: {e}. Representing as string."
                     )
                     final_args = {"value": tc_args_str}
-
+                # Defensive: always ensure id, name, args
+                if not tc_id:
+                    tc_id = str(uuid.uuid4())
+                if not tc_name:
+                    tc_name = "unknown_tool"
+                if not isinstance(final_args, dict):
+                    final_args = {"value": str(final_args)}
                 processed_tool_calls.append(
                     {
                         "id": tc_id,
                         "type": "function",
-                        "name": tc_name or "",
+                        "name": tc_name,
                         "args": final_args,
                     }
                 )
@@ -304,6 +312,13 @@ class AsyncChatMetaLlamaMixin:
                                 f"Failed to parse arguments '{args_str_from_content}' for textual tool call '{tool_name_from_content}': {e}. Using raw string as arg."
                             )
                             parsed_args = {"value": args_str_from_content}
+                    # Defensive: always ensure id, name, args
+                    if not tool_call_id:
+                        tool_call_id = str(uuid.uuid4())
+                    if not tool_name_from_content:
+                        tool_name_from_content = "unknown_tool"
+                    if not isinstance(parsed_args, dict):
+                        parsed_args = {"value": str(parsed_args)}
                     tool_calls_data.append(
                         {
                             "id": tool_call_id,
