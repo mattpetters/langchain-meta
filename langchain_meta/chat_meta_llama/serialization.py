@@ -127,7 +127,7 @@ def _lc_message_to_llama_message_param(
         role = "assistant"
         content_payload = message.content if message.content else None
         if message.tool_calls and len(message.tool_calls) > 0:
-            content_payload = None
+            content_payload = None  # Empty content when there are tool calls
             tool_calls = []
             for tc in message.tool_calls:
                 args_val = tc.get("args")
@@ -177,7 +177,11 @@ def _lc_message_to_llama_message_param(
         content_payload = message.content
     elif isinstance(message, ToolMessage):
         role = "tool"
-        if isinstance(message.content, (list, dict)):
+        if message.content is None or message.content == "":
+            # For tool messages with empty content, provide a default content
+            # to avoid API errors
+            content_payload = f"Tool {message.name} completed successfully."
+        elif isinstance(message.content, (list, dict)):
             try:
                 content_payload = json.dumps(message.content)
             except (TypeError, OverflowError):
@@ -192,19 +196,41 @@ def _lc_message_to_llama_message_param(
 
     msg_dict: Dict[str, Any] = {
         "role": role,
-        "content": content_payload,
     }
+
+    # Only add content key if there's actual content to send
+    if content_payload is not None:
+        if (
+            role == "assistant"
+            and isinstance(content_payload, str)
+            and not content_payload
+        ):
+            # For assistant messages with empty string content, use a structure with empty text
+            msg_dict["content"] = {"type": "text", "text": ""}
+        else:
+            msg_dict["content"] = content_payload
+    elif role != "assistant":
+        # For non-assistant roles with None content, provide empty string
+        # to avoid API validation errors
+        msg_dict["content"] = ""
 
     if tool_calls:
         msg_dict["tool_calls"] = tool_calls
     if tool_call_id:
         msg_dict["tool_call_id"] = tool_call_id
 
-    if role == "assistant" and msg_dict.get("content") is None and msg_dict.get("tool_calls"):
-        del msg_dict["content"]
-
+    # Set stop_reason for assistant messages with tool calls
     if role == "assistant" and stop_reason:
         msg_dict["stop_reason"] = stop_reason
+
+    # Special case for assistant message with tool calls and no content
+    if (
+        role == "assistant"
+        and (content_payload is None or content_payload == "")
+        and tool_calls
+    ):
+        # Ensure content exists as empty text structure
+        msg_dict["content"] = {"type": "text", "text": ""}
 
     return cast(MessageParam, msg_dict)
 
@@ -626,7 +652,7 @@ def _lc_tool_to_llama_tool_param(
     if (
         isinstance(lc_tool, dict)
         and lc_tool.get("type") == "function"  # Check type field first
-        and isinstance(lc_tool.get("function"), dict) # Then check function field
+        and isinstance(lc_tool.get("function"), dict)  # Then check function field
     ):
         try:
             return _convert_dict_tool(lc_tool)  # type: ignore

@@ -20,11 +20,14 @@ from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
     BaseMessage,  # Used by _lc_message_to_llama_message_param if that was here
+    ToolCallChunk,  # For streaming tool calls
 )
+from langchain_core.messages.ai import UsageMetadata
 from langchain_core.outputs import (
     ChatGeneration,
     ChatGenerationChunk,
     ChatResult,
+    LLMResult,  # For callback in streaming
 )
 from langchain_core.tools import BaseTool
 from llama_api_client import LlamaAPIClient
@@ -154,8 +157,8 @@ class SyncChatMetaLlamaMixin:
         # Determine structured output details for metadata
         structured_output_metadata = None
         is_json_mode = (
-            isinstance(kwargs.get("response_format"), dict) and
-            kwargs["response_format"].get("type") == "json_schema"
+            isinstance(kwargs.get("response_format"), dict)
+            and kwargs["response_format"].get("type") == "json_schema"
         )
         is_function_calling = bool(prepared_llm_tools)
         if is_json_mode or is_function_calling:
@@ -163,11 +166,17 @@ class SyncChatMetaLlamaMixin:
             current_method = None
             if is_json_mode:
                 current_method = "json_mode"
-                current_schema_dict = kwargs["response_format"]["json_schema"].get("schema")
+                current_schema_dict = kwargs["response_format"]["json_schema"].get(
+                    "schema"
+                )
             elif is_function_calling and prepared_llm_tools:
                 current_method = "function_calling"
-                if prepared_llm_tools[0].get("function") and prepared_llm_tools[0]["function"].get("parameters"):
-                    current_schema_dict = prepared_llm_tools[0]["function"]["parameters"]
+                if prepared_llm_tools[0].get("function") and prepared_llm_tools[0][
+                    "function"
+                ].get("parameters"):
+                    current_schema_dict = prepared_llm_tools[0]["function"][
+                        "parameters"
+                    ]
             if current_schema_dict and current_method:
                 structured_output_metadata = {
                     "ls_structured_output_format": {
@@ -175,7 +184,9 @@ class SyncChatMetaLlamaMixin:
                         "method": current_method,
                     }
                 }
-                logger.debug(f"_generate: Prepared structured output metadata: {structured_output_metadata}")
+                logger.debug(
+                    f"_generate: Prepared structured output metadata: {structured_output_metadata}"
+                )
 
         final_kwargs_for_prepare = kwargs.copy()
         final_kwargs_for_prepare.pop("tools", None)
@@ -521,12 +532,11 @@ class SyncChatMetaLlamaMixin:
         # Trigger on_chat_model_start callback with metadata
         if llm_run_manager:
             invocation_params = self._get_invocation_params(
-                api_params=api_params,
-                **final_kwargs_for_prepare
+                api_params=api_params, **final_kwargs_for_prepare
             )
             # This callback should be handled by the base class before _generate is called.
             # If we need to pass options/metadata, it should happen via the config.
-            pass # Placeholder - Callback triggering is handled by base class
+            pass  # Placeholder - Callback triggering is handled by base class
 
         if self.temperature is not None and "temperature" not in api_params:
             api_params["temperature"] = self.temperature
@@ -538,24 +548,21 @@ class SyncChatMetaLlamaMixin:
         messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
         run_manager: Optional[CallbackManagerForLLMRun] = None,
-        tools: Optional[List[Union[Dict, Type[BaseModel], Callable, BaseTool]]] = None,
-        tool_choice: Optional[
-            Union[dict, str, Literal["auto", "none", "any", "required"]]
-        ] = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
-        """Synchronously streams chat responses using LlamaAPIClient."""
+        """Main synchronous streaming method for Llama API."""
         self._ensure_client_initialized()
         if self._client is None:
             raise ValueError("LlamaAPIClient not initialized.")
 
-        # Use client from kwargs if provided (e.g. for testing), else use self._client
         active_client = kwargs.get("client") or self._client
-        if not active_client:  # Should be caught by above, but defensive
+        if not active_client:
             raise ValueError("Could not obtain an active LlamaAPIClient.")
 
-        effective_tools_lc_input = tools
-        if effective_tools_lc_input is None and "tools" in kwargs:
+        effective_tools_lc_input = kwargs.get("tools")
+        if (
+            effective_tools_lc_input is None and "tools" in kwargs
+        ):  # Check if tools came from .bind()
             effective_tools_lc_input = kwargs.get("tools")
             logger.debug(
                 "_stream (sync): Using 'tools' from **kwargs as direct 'tools' parameter was None."
@@ -577,10 +584,6 @@ class SyncChatMetaLlamaMixin:
 
         final_kwargs_for_prepare = kwargs.copy()
         final_kwargs_for_prepare.pop("tools", None)
-        if tool_choice is not None:
-            final_kwargs_for_prepare["tool_choice"] = tool_choice
-        # tool_choice is implicitly handled by Llama API if tools are present or not for streaming.
-        # If tool_choice needs to be explicitly passed for streaming, it would go into final_kwargs_for_prepare.
 
         api_params = self._prepare_api_params(
             messages,
@@ -589,115 +592,375 @@ class SyncChatMetaLlamaMixin:
             stream=True,
             **final_kwargs_for_prepare,
         )
-        logger.debug(f"Llama API (sync stream) Request: {api_params}")
 
-        for chunk_result in active_client.chat.completions.create(**api_params):
-            logger.debug(
-                f"Llama API (sync stream) Stream Chunk: {chunk_result.to_dict()}"
-            )
-            chunk_dict = chunk_result.to_dict()
-            content_str = ""
+        # For collecting chunks to create a final response at the end
+        all_chunks: List[ChatGenerationChunk] = []
 
-            # Enhanced content extraction for streaming chunks
-            if (
-                hasattr(chunk_result, "completion_message")
-                and chunk_result.completion_message
-            ):
-                completion_msg = chunk_result.completion_message
+        # Buffer for tool call chunks - track by index
+        current_tool_call_index = (
+            0  # To assign index for AIMessageChunk tool_call_chunks
+        )
 
-                # Direct attribute access method - attempt 1
-                if hasattr(completion_msg, "content") and completion_msg.content:
-                    content = completion_msg.content
-                    if isinstance(content, dict) and "text" in content:
-                        content_str = content["text"]
-                    elif isinstance(content, str):
-                        content_str = content
+        try:
+            logger.debug(f"Llama API (sync stream) Request: {api_params}")
+            for chunk in active_client.chat.completions.create(**api_params):
+                logger.debug(f"Llama API (sync stream) Stream Chunk: {chunk.to_dict()}")
+                chunk_dict = chunk.to_dict()
+                content_str = ""
 
-                # Dictionary-based access - attempt 2
-                if not content_str and hasattr(completion_msg, "to_dict"):
+                # Enhanced content extraction (similar to _generate method)
+                if hasattr(chunk, "completion_message") and chunk.completion_message:
+                    completion_msg = chunk.completion_message
+                    if hasattr(completion_msg, "content") and completion_msg.content:
+                        content = completion_msg.content
+                        if isinstance(content, dict) and "text" in content:
+                            content_str = content["text"]
+                        elif isinstance(content, str):
+                            content_str = content
+                    if not content_str and hasattr(completion_msg, "to_dict"):
+                        try:
+                            msg_dict = completion_msg.to_dict()
+                            if isinstance(msg_dict, dict) and "content" in msg_dict:
+                                content_dict = msg_dict["content"]
+                                if (
+                                    isinstance(content_dict, dict)
+                                    and "text" in content_dict
+                                ):
+                                    content_str = content_dict["text"]
+                                elif isinstance(content_dict, str):
+                                    content_str = content_dict
+                        except (AttributeError, TypeError, KeyError):
+                            pass
+                if not content_str and chunk_dict:
                     try:
-                        msg_dict = completion_msg.to_dict()
-                        if isinstance(msg_dict, dict) and "content" in msg_dict:
-                            content_dict = msg_dict["content"]
+                        if "completion_message" in chunk_dict:
+                            completion_dict = chunk_dict["completion_message"]
                             if (
-                                isinstance(content_dict, dict)
-                                and "text" in content_dict
+                                isinstance(completion_dict, dict)
+                                and "content" in completion_dict
                             ):
-                                content_str = content_dict["text"]
-                            elif isinstance(content_dict, str):
-                                content_str = content_dict
-                    except (AttributeError, TypeError, KeyError):
-                        pass
-
-            # Traverse the full chunk dictionary if needed - attempt 3
-            if not content_str and chunk_dict:
-                try:
-                    # Check completion_message in the chunk dictionary
-                    if "completion_message" in chunk_dict:
-                        comp_msg = chunk_dict["completion_message"]
-                        if isinstance(comp_msg, dict) and "content" in comp_msg:
-                            content = comp_msg["content"]
-                            if isinstance(content, dict) and "text" in content:
-                                content_str = content["text"]
-                            elif isinstance(content, str):
-                                content_str = content
-
-                    # Look in response_metadata if it exists
-                    if not content_str and "response_metadata" in chunk_dict:
-                        response_meta = chunk_dict["response_metadata"]
-                        if (
-                            isinstance(response_meta, dict)
-                            and "completion_message" in response_meta
-                        ):
-                            comp_msg = response_meta["completion_message"]
-                            if isinstance(comp_msg, dict) and "content" in comp_msg:
-                                content = comp_msg["content"]
+                                content = completion_dict["content"]
                                 if isinstance(content, dict) and "text" in content:
                                     content_str = content["text"]
                                 elif isinstance(content, str):
                                     content_str = content
-                except (KeyError, TypeError):
-                    pass
+                    except (TypeError, KeyError):
+                        pass
 
-            generation_info = {}
-            if hasattr(chunk_result, "stop_reason") and chunk_result.stop_reason:
-                generation_info["finish_reason"] = chunk_result.stop_reason
-            elif hasattr(chunk_result, "finish_reason") and chunk_result.finish_reason:
-                generation_info["finish_reason"] = chunk_result.finish_reason
+                generation_info = {}
+                if hasattr(chunk, "model") and chunk.model:
+                    generation_info["model_name"] = chunk.model
 
-            if chunk_dict.get("x_request_id"):
-                generation_info["x_request_id"] = chunk_dict.get("x_request_id")
-            if hasattr(chunk_result, "usage") and chunk_result.usage:
-                generation_info["chunk_usage"] = chunk_result.usage.to_dict()
+                if hasattr(chunk, "stop_reason") and chunk.stop_reason:
+                    generation_info["finish_reason"] = chunk.stop_reason
 
-            chunk_tool_calls = []
-            if (
-                hasattr(chunk_result, "completion_message")
-                and chunk_result.completion_message
-                and hasattr(chunk_result.completion_message, "tool_calls")
-                and chunk_result.completion_message.tool_calls
-            ):
-                for idx, tc in enumerate(chunk_result.completion_message.tool_calls):
-                    tool_call_data = {
-                        "id": getattr(tc, "id", f"tc_{idx}"),
-                        "type": "function",
-                        "name": getattr(tc.function, "name", None)
-                        if hasattr(tc, "function")
-                        else None,
-                        "args": getattr(tc.function, "arguments", "")
-                        if hasattr(tc, "function")
-                        else "",
-                        "index": idx,
-                    }
-                    chunk_tool_calls.append(tool_call_data)
+                if chunk_dict.get("x_request_id"):
+                    generation_info["x_request_id"] = chunk_dict.get("x_request_id")
+                if hasattr(chunk, "usage") and chunk.usage:
+                    generation_info["chunk_usage"] = chunk.usage.to_dict()
 
-            chunk = ChatGenerationChunk(
-                message=AIMessageChunk(
-                    content=content_str or "",
-                    tool_call_chunks=chunk_tool_calls if chunk_tool_calls else [],
-                ),
-                generation_info=generation_info if generation_info else None,
-            )
+                # Process native tool calls from the API chunk
+                chunk_tool_calls_for_aimc_obj: List[ToolCallChunk] = []
+                # Access completion_message from the client's chunk object
+                llama_chunk_completion_message = getattr(
+                    chunk, "completion_message", None
+                )
+
+                if (
+                    llama_chunk_completion_message
+                    and hasattr(llama_chunk_completion_message, "tool_calls")
+                    and llama_chunk_completion_message.tool_calls
+                ):
+                    for tc_data in llama_chunk_completion_message.tool_calls:
+                        tc_name = getattr(tc_data, "name", None)
+                        if (
+                            tc_name is None
+                            and hasattr(tc_data, "function")
+                            and tc_data.function
+                        ):
+                            tc_name = getattr(tc_data.function, "name", None)
+
+                        tc_args = {}
+                        if hasattr(tc_data, "function") and tc_data.function:
+                            func = tc_data.function
+                            if hasattr(func, "arguments"):
+                                args_str = getattr(func, "arguments", "")
+                                try:
+                                    tc_args = json.loads(args_str) if args_str else {}
+                                except json.JSONDecodeError:
+                                    tc_args = parse_malformed_args_string(args_str)
+
+                        tc_id = getattr(tc_data, "id", None) or str(uuid.uuid4())
+
+                        chunk_tool_calls_for_aimc_obj.append(
+                            ToolCallChunk(
+                                name=tc_name or "unknown_tool",
+                                args=args_str
+                                if isinstance(args_str, str)
+                                else json.dumps(tc_args),
+                                id=tc_id,
+                                index=current_tool_call_index,
+                            )
+                        )
+                        current_tool_call_index += 1
+
+                        # For native tool calls, empty the content string
+                        content_str = ""
+                        generation_info["finish_reason"] = "tool_calls"
+
+                # If no native tool calls in this chunk, try to parse from content_str
+                if (
+                    not chunk_tool_calls_for_aimc_obj
+                    and prepared_llm_tools
+                    and content_str
+                ):
+                    match = re.fullmatch(
+                        r"\s*\[\s*([a-zA-Z0-9_]+)\s*(?:\(\s*(.*?)\s*\))?\s*\]\s*",
+                        content_str,
+                    )
+                    if match:
+                        tool_name_from_content = match.group(1)
+                        args_str_from_content = match.group(
+                            2
+                        )  # This is a string, possibly JSON or empty
+
+                        available_tool_names = [
+                            t["function"]["name"]
+                            for t in prepared_llm_tools
+                            if isinstance(t, dict)
+                            and "function" in t
+                            and "name" in t["function"]
+                        ]
+
+                        if tool_name_from_content in available_tool_names:
+                            logger.info(
+                                f"Parsing textual tool call from streaming content: {tool_name_from_content}"
+                            )
+                            tool_call_id = str(uuid.uuid4())
+
+                            # For AIMessageChunk, 'args' should be the string delta
+                            args_for_chunk_str = (
+                                args_str_from_content
+                                if args_str_from_content is not None
+                                else ""
+                            )
+
+                            chunk_tool_calls_for_aimc_obj.append(
+                                ToolCallChunk(
+                                    name=tool_name_from_content,
+                                    args=args_for_chunk_str,
+                                    id=tool_call_id,
+                                    index=current_tool_call_index,
+                                )
+                            )
+                            current_tool_call_index += 1
+                            content_str = ""  # Clear content as it's now a tool call
+                            generation_info["finish_reason"] = "tool_calls"
+                        else:
+                            logger.warning(
+                                f"Textual tool call '{tool_name_from_content}' found in stream, but not in available tool names: {available_tool_names}"
+                            )
+                    else:
+                        logger.debug(
+                            f"Content '{content_str}' did not match textual tool call pattern."
+                        )
+
+                # Create the AIMessageChunk with any content or tool calls found
+                message = AIMessageChunk(
+                    content=content_str,
+                    tool_call_chunks=chunk_tool_calls_for_aimc_obj
+                    if chunk_tool_calls_for_aimc_obj
+                    else [],
+                )
+
+                # Add usage metadata if available
+                if hasattr(chunk, "usage") and chunk.usage:
+                    try:
+                        usage_dict = {}
+                        for field in [
+                            "prompt_tokens",
+                            "completion_tokens",
+                            "total_tokens",
+                        ]:
+                            if hasattr(chunk.usage, field):
+                                usage_dict[field.replace("_tokens", "_")] = getattr(
+                                    chunk.usage, field
+                                )
+                        if usage_dict:
+                            message.usage_metadata = UsageMetadata(
+                                input_tokens=usage_dict.get("prompt_", 0),
+                                output_tokens=usage_dict.get("completion_", 0),
+                                total_tokens=usage_dict.get("total_", 0),
+                            )
+                            generation_info["usage_metadata"] = {
+                                "input_tokens": usage_dict.get("prompt_", 0),
+                                "output_tokens": usage_dict.get("completion_", 0),
+                                "total_tokens": usage_dict.get("total_", 0),
+                            }
+                    except Exception as e:
+                        logger.warning(f"Error adding usage metadata to chunk: {e}")
+
+                # Create and yield the chunk
+                chat_generation_chunk = ChatGenerationChunk(
+                    message=message,
+                    generation_info=generation_info,
+                )
+
+                # Store the chunk for final message processing
+                all_chunks.append(chat_generation_chunk)
+
+                # Yield the chunk to the caller
+                yield chat_generation_chunk
+
+                # Send to callback if present
+                if run_manager:
+                    run_manager.on_llm_new_token(
+                        token=content_str,
+                        chunk=chat_generation_chunk,
+                    )
+
+            # Process the collected chunks into a final result
+            if all_chunks and run_manager:
+                # Process the final message
+                final_content = ""
+                final_tool_calls = []
+                final_generation_info = {}
+                prompt_tokens = 0
+                completion_tokens = 0
+                total_tokens = 0
+
+                # First aggregate tool calls and chunks
+                chunk_index_to_tool_calls = {}
+                for chunk in all_chunks:
+                    # If the chunk's message has tool_call_chunks, save them for processing
+                    if (
+                        hasattr(chunk.message, "tool_call_chunks")
+                        and chunk.message.tool_call_chunks
+                    ):
+                        for tc_chunk in chunk.message.tool_call_chunks:
+                            tc_index = getattr(tc_chunk, "index", None)
+                            if tc_index is None:
+                                continue
+
+                            if tc_index not in chunk_index_to_tool_calls:
+                                chunk_index_to_tool_calls[tc_index] = {
+                                    "id": tc_chunk.id,
+                                    "name": tc_chunk.name,
+                                    "args_chunks": [],
+                                    "type": "function",
+                                }
+
+                            # Append args to the accumulated args for this index
+                            args_val = tc_chunk.args
+                            if args_val:
+                                chunk_index_to_tool_calls[tc_index][
+                                    "args_chunks"
+                                ].append(args_val)
+
+                    # Accumulate content chunks
+                    if hasattr(chunk.message, "content") and chunk.message.content:
+                        final_content += chunk.message.content
+
+                    # Accumulate usage metadata (taking the last complete one)
+                    if (
+                        hasattr(chunk.message, "generation_info")
+                        and chunk.message.generation_info
+                    ):
+                        gen_info = chunk.message.generation_info
+                        if "finish_reason" in gen_info:
+                            final_generation_info["finish_reason"] = gen_info[
+                                "finish_reason"
+                            ]
+                        if "usage_metadata" in gen_info:
+                            # Get token counts from usage
+                            usage = gen_info["usage_metadata"]
+                            if "input_tokens" in usage and usage["input_tokens"]:
+                                prompt_tokens = max(
+                                    prompt_tokens, int(usage["input_tokens"])
+                                )
+                            if "output_tokens" in usage and usage["output_tokens"]:
+                                completion_tokens += int(usage["output_tokens"])
+                            if "total_tokens" in usage and usage["total_tokens"]:
+                                total_tokens = max(
+                                    total_tokens, int(usage["total_tokens"])
+                                )
+
+                # Process the accumulated tool call chunks to build complete tool calls
+                for idx, tc_data in chunk_index_to_tool_calls.items():
+                    args_str = "".join(tc_data["args_chunks"])
+                    # Parse args if needed
+                    try:
+                        args_dict = json.loads(args_str)
+                    except json.JSONDecodeError:
+                        # Fall back to the string parsing utility
+                        args_dict = _parse_textual_tool_args(args_str)
+
+                    final_tool_calls.append(
+                        {
+                            "id": tc_data["id"],
+                            "name": tc_data["name"],
+                            "args": args_dict,
+                            "type": "function",
+                        }
+                    )
+
+                # If there were tool calls, set finish_reason
+                if final_tool_calls:
+                    final_generation_info["finish_reason"] = "tool_calls"
+                    # Clear content if it appears to be a tool call in text form
+                    if final_content and re.fullmatch(
+                        r"\s*\[\s*([a-zA-Z0-9_]+)\s*(?:\(\s*(.*?)\s*\))?\s*\]\s*",
+                        final_content,
+                    ):
+                        final_content = ""
+
+                # If usage info wasn't in generation_info, calculate something reasonable
+                if not total_tokens:
+                    total_tokens = prompt_tokens + completion_tokens
+
+                # Special case: If completion_tokens is 0 but we have content, estimate
+                if completion_tokens == 0 and final_content:
+                    completion_tokens = len(final_content) // 4  # Rough estimate
+                    total_tokens = prompt_tokens + completion_tokens
+
+                # Create final AIMessage
+                final_message = AIMessage(
+                    content=final_content,
+                    tool_calls=final_tool_calls if final_tool_calls else None,
+                )
+
+                # Add usage metadata to the message
+                if prompt_tokens or completion_tokens:
+                    final_message.usage_metadata = UsageMetadata(
+                        input_tokens=prompt_tokens,
+                        output_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                    )
+
+                # Final generation for callback
+                final_generation = ChatGeneration(
+                    message=final_message, generation_info=final_generation_info
+                )
+
+                # Create LLMResult for the callback
+                llm_result = LLMResult(
+                    generations=[[final_generation]],
+                    llm_output={
+                        "token_usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": total_tokens,
+                        },
+                        "model_name": self.model_name,
+                    },
+                )
+
+                # Send to the callback
+                if run_manager and hasattr(run_manager, "on_llm_end"):
+                    run_manager.on_llm_end(llm_result)
+
+        except Exception as e:
+            logger.error(f"Error in _stream: {e}", exc_info=True)
             if run_manager:
-                run_manager.on_llm_new_token(chunk.text, chunk=chunk)
-            yield chunk
+                run_manager.on_llm_error(e)
+            raise
