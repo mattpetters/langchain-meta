@@ -581,11 +581,24 @@ def _convert_structured_tool(
     # The Llama API examples show parameters: {} when no params, so ensure it's at least an empty dict.
     if not llama_parameters.get("properties") and not llama_parameters.get("required"):
         # Ensure function_def exists and is a dict before assigning to its keys
-        if function_def is None:
-            function_def = {}  # Should not happen if logic above is correct
-        function_def[
-            "parameters"
-        ] = {}  # Ensure parameters is {} if no props/required, not just containing additionalProperties:false
+        if (
+            function_def is None
+            or not function_def.get("name")
+            or not function_def.get("description")
+        ):
+            logger.warning(
+                f"Function definition is incomplete or None for tool {name}. Creating minimal fallback."
+            )
+            function_def = {
+                "name": name,
+                "description": description,
+                "parameters": {},
+                "strict": True,
+            }
+        else:
+            function_def[
+                "parameters"
+            ] = {}  # Ensure parameters is {} if no props/required, not just containing additionalProperties:false
     elif "properties" not in llama_parameters:  # if only required is present
         llama_parameters[
             "properties"
