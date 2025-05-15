@@ -26,6 +26,10 @@ from llama_api_client.types.chat import (
     completion_create_params,
 )
 from pydantic import BaseModel
+from langchain_core.utils.pydantic import is_basemodel_subclass, is_pydantic_v1_subclass
+from langchain_core.utils.function_calling import (
+    convert_to_openai_tool,
+)  # Ensure import
 
 logger = logging.getLogger(__name__)
 
@@ -112,52 +116,128 @@ def serialize_message(message: BaseMessage) -> Dict[str, Any]:
 
 def _lc_message_to_llama_message_param(
     message: BaseMessage,
+    available_tools_with_schema: Optional[List[completion_create_params.Tool]] = None,
 ) -> MessageParam:
     """Converts a LangChain BaseMessage to a Llama API MessageParam."""
     role: str
     content: Union[str, Dict[str, Any]]
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
-    stop_reason: Optional[str] = None
 
     if isinstance(message, HumanMessage):
         role = "user"
         content_payload = message.content
     elif isinstance(message, AIMessage):
         role = "assistant"
-        content_payload = message.content if message.content else ""
+        content_payload = message.content if message.content is not None else ""
         if message.tool_calls and len(message.tool_calls) > 0:
-            tool_calls = []
+            processed_tool_calls = []
             for tc in message.tool_calls:
                 args_val = tc.get("args")
+                # Ensure args_dict is a dictionary
                 if isinstance(args_val, str):
                     try:
                         args_dict = json.loads(args_val)
                     except Exception:
+                        logger.warning(
+                            f"Failed to parse tool call args string: {args_val}. Representing as {{'value': args_val}}"
+                        )
                         args_dict = {"value": args_val}
                 elif isinstance(args_val, dict):
                     args_dict = args_val
-                else:
+                elif args_val is None:  # Explicitly handle None
+                    args_dict = {}
+                else:  # Handle other non-dict, non-string, non-None types
                     args_dict = {"value": str(args_val)}
-                tool_calls.append(
+
+                # Coerce arguments if schema is available
+                if available_tools_with_schema:
+                    tool_name = tc.get("name")
+                    tool_def_found: Optional[completion_create_params.Tool] = None
+                    for tool_definition in available_tools_with_schema:
+                        # tool_definition is completion_create_params.Tool, a TypedDict
+                        current_fn_def = tool_definition.get("function")
+                        if (
+                            tool_definition.get("type") == "function"
+                            and current_fn_def
+                            and isinstance(current_fn_def, dict)
+                            and current_fn_def.get("name") == tool_name
+                        ):
+                            tool_def_found = tool_definition
+                            break
+                    if tool_def_found:
+                        param_properties: Optional[Dict[str, Any]] = None
+                        fn_def_from_found = tool_def_found.get("function")
+                        if fn_def_from_found and isinstance(fn_def_from_found, dict):
+                            params_schema = fn_def_from_found.get("parameters")
+                            if params_schema and isinstance(params_schema, dict):
+                                # The 'parameters' field holds the JSON schema object,
+                                # which should have a 'properties' key if it defines an object with properties.
+                                properties_val = params_schema.get("properties")
+                                if isinstance(properties_val, dict):
+                                    param_properties = properties_val
+                                else:
+                                    param_properties = {}  # No properties defined for this tool, or not an object schema
+                            else:
+                                param_properties = {}  # No parameters schema for this tool
+                        else:
+                            param_properties = {}  # No function definition in found tool, should not happen if outer check passed
+
+                        if (
+                            param_properties
+                        ):  # Ensure param_properties is a dict and not None
+                            coerced_args_dict = {}
+                            for arg_name, arg_value in args_dict.items():
+                                prop_schema = param_properties.get(arg_name)
+                                if (
+                                    prop_schema
+                                    and isinstance(prop_schema, dict)
+                                    and isinstance(arg_value, str)
+                                ):
+                                    expected_type = prop_schema.get("type")
+                                    try:
+                                        if expected_type == "integer":
+                                            coerced_args_dict[arg_name] = int(arg_value)
+                                        elif (
+                                            expected_type == "number"
+                                        ):  # JSON schema "number" can be float or int
+                                            coerced_args_dict[arg_name] = float(
+                                                arg_value
+                                            )
+                                        elif expected_type == "boolean":
+                                            if arg_value.lower() == "true":
+                                                coerced_args_dict[arg_name] = True
+                                            elif arg_value.lower() == "false":
+                                                coerced_args_dict[arg_name] = False
+                                            else:
+                                                logger.warning(
+                                                    f"Cannot coerce string '{arg_value}' to boolean for arg '{arg_name}'. Keeping as string."
+                                                )
+                                                coerced_args_dict[arg_name] = arg_value
+                                        else:
+                                            coerced_args_dict[arg_name] = arg_value
+                                    except ValueError:
+                                        logger.warning(
+                                            f"Failed to coerce string arg '{arg_name}' value '{arg_value}' to type '{expected_type}'. Keeping as string."
+                                        )
+                                        coerced_args_dict[arg_name] = arg_value
+                                else:
+                                    coerced_args_dict[arg_name] = arg_value
+                            args_dict = coerced_args_dict
+
+                processed_tool_calls.append(
                     {
-                        "id": tc["id"],
+                        "id": tc.get("id") or str(uuid.uuid4()),  # Ensure ID
                         "type": "function",
                         "function": {
-                            "name": tc["name"],
+                            "name": tc.get("name"),
                             "arguments": json.dumps(args_dict),
                         },
                     }
                 )
-            if (
-                hasattr(message, "generation_info")
-                and message.generation_info
-                and "finish_reason" in message.generation_info
-            ):
-                if message.generation_info["finish_reason"] == "tool_calls":
-                    stop_reason = "tool_calls"
-            elif tool_calls:
-                stop_reason = "tool_calls"
+            # Assign processed tool calls to the outer scope variable intended for the message dict
+            tool_calls = processed_tool_calls
+
     elif isinstance(message, SystemMessage):
         role = "system"
         content_payload = message.content
@@ -183,9 +263,6 @@ def _lc_message_to_llama_message_param(
 
     if role == "assistant" and tool_calls:
         msg_dict["content"] = ""
-
-    if role == "assistant" and stop_reason:
-        msg_dict["stop_reason"] = stop_reason
 
     return cast(MessageParam, msg_dict)
 
@@ -501,9 +578,11 @@ def _convert_structured_tool(
         "parameters": llama_parameters,
         "strict": True,
     }
-    # We removed additionalProperties earlier, ensure parameters itself is not empty for valid API call if no properties.
     # The Llama API examples show parameters: {} when no params, so ensure it's at least an empty dict.
     if not llama_parameters.get("properties") and not llama_parameters.get("required"):
+        # Ensure function_def exists and is a dict before assigning to its keys
+        if function_def is None:
+            function_def = {}  # Should not happen if logic above is correct
         function_def[
             "parameters"
         ] = {}  # Ensure parameters is {} if no props/required, not just containing additionalProperties:false
@@ -511,7 +590,23 @@ def _convert_structured_tool(
         llama_parameters[
             "properties"
         ] = {}  # Llama might expect properties key even if empty if other keys like required are present
+        if function_def is None:
+            function_def = {}  # Should not happen
         function_def["parameters"] = llama_parameters
+
+    # Ensure function_def is not None before returning
+    if function_def is None:
+        # This case implies lc_tool was not a BaseTool or did not have a valid schema,
+        # and llama_parameters remained empty. We should create a minimal valid function_def.
+        logger.warning(
+            f"Function definition was unexpectedly None for tool {name}. Creating minimal fallback."
+        )
+        function_def = {
+            "name": name,
+            "description": description,
+            "parameters": {},
+            "strict": True,
+        }
 
     return {"type": "function", "function": function_def}
 
@@ -599,54 +694,29 @@ def _create_minimal_tool(lc_tool: Any) -> dict:
     }
 
 
-def _lc_tool_to_llama_tool_param(
-    lc_tool: Union[Dict[str, Any], Type[BaseModel], Callable, BaseTool],
-) -> completion_create_params.Tool:
-    """Convert LangChain tool to Llama API format using a refined dispatcher pattern."""
-    # Check for direct Llama API dict format first (common for bind_tools with pre-formatted dicts)
-    if (
-        isinstance(lc_tool, dict)
-        and "function" in lc_tool
-        and isinstance(lc_tool["function"], dict)
-    ):
-        try:
-            return _convert_dict_tool(lc_tool)  # type: ignore
-        except ValueError:
-            pass  # Fall through if not perfectly matching
+# Helper function to check for TypedDict, supporting older typing_extensions
+_TYPED_DICT_META_TYPES = []
+try:
+    from typing import _TypedDictMeta  # type: ignore
 
-    # Pydantic model class (e.g., MyToolSchema(BaseModel))
-    if isinstance(lc_tool, type) and issubclass(lc_tool, BaseModel):
-        return _convert_pydantic_class_tool(lc_tool)  # type: ignore
+    _TYPED_DICT_META_TYPES.append(_TypedDictMeta)
+except ImportError:
+    pass
+try:
+    from typing_extensions import _TypedDictMeta as _TypedDictMetaExtensions  # type: ignore
 
-    # LangChain BaseTool (includes StructuredTool, Tool)
-    if isinstance(lc_tool, BaseTool):
-        # StructuredTool and Tool have .name, .description, and often .args_schema or .schema_
-        return _convert_structured_tool(lc_tool)  # type: ignore
+    _TYPED_DICT_META_TYPES.append(_TypedDictMetaExtensions)
+except ImportError:
+    pass
 
-    # LangChain tools defined via @tool decorator (becomes a Runnable with .name, .description, .args_schema)
-    # This case is often caught by BaseTool isinstance check if @tool produces a BaseTool subclass.
-    # If it produces a plain Callable wrapped in some other Runnable, more checks might be needed.
-    # For now, relying on BaseTool check or falling through.
 
-    # If it has a parse method (less common for direct Llama tools but for completeness)
-    if hasattr(lc_tool, "parse") and callable(getattr(lc_tool, "parse")):
-        try:
-            return _convert_parse_method_tool(lc_tool)  # type: ignore
-        except ValueError:
-            pass
-
-    # Application-specific named tool like RouteSchema (if this pattern is intended to be general)
-    if hasattr(lc_tool, "name") and getattr(lc_tool, "name") in [
-        "RouteSchema",
-        "route_schema",
-    ]:
-        try:
-            return _convert_route_schema_tool(lc_tool)  # type: ignore
-        except ValueError:
-            pass
-
-    # Fallback for any other type or if above conversions failed subtly
-    return _create_minimal_tool(lc_tool)  # type: ignore
+def _is_typeddict(tool_type: Type) -> bool:
+    if not _TYPED_DICT_META_TYPES:
+        # Fallback if metaclasses can't be imported, check for common TypedDict attributes
+        return hasattr(tool_type, "__required_keys__") or hasattr(
+            tool_type, "__optional_keys__"
+        )
+    return isinstance(tool_type, tuple(_TYPED_DICT_META_TYPES))
 
 
 def _normalize_tool_call(tc: dict) -> dict:
@@ -829,3 +899,133 @@ def _parse_textual_tool_args(args_str: Optional[str]) -> Dict[str, Any]:
         return {"value": args_str}
 
     return args
+
+
+def _lc_tool_to_llama_tool_param(
+    lc_tool: Union[Dict[str, Any], Type[BaseModel], Callable, BaseTool],
+) -> completion_create_params.Tool:
+    """Converts a LangChain tool/schema to a Llama API tool parameter structure using langchain_core's convert_to_openai_tool."""
+
+    tool_name_for_log = str(lc_tool)
+    if hasattr(lc_tool, "__name__") and not isinstance(lc_tool, dict):
+        tool_name_for_log = lc_tool.__name__
+    elif isinstance(lc_tool, dict) and (lc_tool.get("name") or lc_tool.get("title")):
+        tool_name_for_log = str(lc_tool.get("name") or lc_tool.get("title"))
+
+    try:
+        # convert_to_openai_tool is robust and handles Pydantic models, dicts (JSON schema), TypedDicts, functions, BaseTools.
+        openai_tool_dict = convert_to_openai_tool(lc_tool)
+
+        if "function" not in openai_tool_dict or not isinstance(
+            openai_tool_dict["function"], dict
+        ):
+            raise ValueError(
+                "convert_to_openai_tool did not return the expected structure with a 'function' dict."
+            )
+
+        func_dict = openai_tool_dict["function"]
+
+        # Ensure parameters schema is valid at a basic level for Llama
+        final_parameters = func_dict.get("parameters", {})
+        if not isinstance(final_parameters, dict):
+            logger.warning(
+                f"Parameters for tool '{func_dict.get('name')}' were not a dict: {final_parameters}. Defaulting to empty schema."
+            )
+            final_parameters = {"type": "object", "properties": {}}
+
+        # Ensure basic structure and simplify Optional fields for Llama API
+        if not final_parameters:  # If parameters was an empty dict
+            final_parameters = {"type": "object", "properties": {}}
+        elif "type" not in final_parameters:  # type key is expected by Llama
+            final_parameters["type"] = "object"
+
+        if final_parameters.get("type") == "object":
+            if "properties" not in final_parameters:
+                final_parameters["properties"] = {}
+            else:
+                # Simplify Optional fields (anyOf with null)
+                properties = final_parameters.get("properties")
+                if isinstance(properties, dict):
+                    for prop_name, prop_schema in list(
+                        properties.items()
+                    ):  # Iterate over a copy
+                        if isinstance(prop_schema, dict) and "anyOf" in prop_schema:
+                            any_of_options = prop_schema.get("anyOf", [])
+                            non_null_schemas = [
+                                opt
+                                for opt in any_of_options
+                                if isinstance(opt, dict) and opt.get("type") != "null"
+                            ]
+                            has_null = any(
+                                isinstance(opt, dict) and opt.get("type") == "null"
+                                for opt in any_of_options
+                            )
+
+                            if has_null and len(non_null_schemas) == 1:
+                                # This is a simple Optional[Type], e.g., Optional[str]
+                                simplified_schema = non_null_schemas[0].copy()
+
+                                # Preserve description and title from the original prop_schema
+                                # if they existed at the top level of the property definition.
+                                # Pydantic's model_json_schema often puts description inside the
+                                # anyOf subschema for the non-null type, which is good.
+                                # This ensures if it was at the outer level, it's not lost.
+                                if (
+                                    "description" in prop_schema
+                                    and "description" not in simplified_schema
+                                ):
+                                    simplified_schema["description"] = prop_schema[
+                                        "description"
+                                    ]
+                                if (
+                                    "title" in prop_schema
+                                    and "title" not in simplified_schema
+                                ):
+                                    simplified_schema["title"] = prop_schema["title"]
+                                # Other schema keywords like 'enum', 'format', 'default' from non_null_schemas[0]
+                                # are carried over by .copy().
+
+                                properties[prop_name] = simplified_schema
+                                logger.debug(
+                                    f"Simplified Optional schema for field '{prop_name}' from {prop_schema} to {simplified_schema}"
+                                )
+                            elif has_null and len(non_null_schemas) > 1:
+                                # This is Optional[Union[TypeA, TypeB, ...]]
+                                logger.warning(
+                                    f"Field '{prop_name}' is an Optional Union of multiple non-null types: {prop_schema}. "
+                                    f"This complex structure might not be fully supported by Llama API. Leaving as is."
+                                )
+                            # If not has_null, or no non_null_schemas, or other complex cases,
+                            # leave it as is. convert_to_openai_tool might have done its best.
+
+        # Ensure 'parameters' is not None before passing to Tool TypedDict
+        if final_parameters is None:  # Should be an empty dict if no params
+            final_parameters = {"type": "object", "properties": {}}
+
+        return completion_create_params.Tool(
+            type="function",
+            function={
+                "name": str(func_dict.get("name")),
+                "description": str(
+                    func_dict.get("description", "")
+                ),  # Ensure description is a string
+                "parameters": final_parameters,
+                "strict": True,
+            },
+        )
+
+    except Exception as e:
+        logger.error(
+            f"Failed to convert tool '{tool_name_for_log}' (type: {type(lc_tool)}) to Llama tool format: {e}. Creating a dummy tool.",
+            exc_info=True,
+        )
+        dummy_name = f"fallback_{tool_name_for_log.replace(' ', '_')[:20]}_{str(uuid.uuid4())[:4]}"
+        return completion_create_params.Tool(
+            type="function",
+            function={
+                "name": dummy_name,
+                "description": f"Fallback due to conversion error for {tool_name_for_log}",
+                "parameters": {"type": "object", "properties": {}},
+                "strict": True,
+            },
+        )

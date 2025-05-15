@@ -1,0 +1,402 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+- Use the llama-api-client source for integration help
+
+Tool calling with Llama API
+
+Examples:
+
+```bash
+curl "https://api.llama.com/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $LLAMA_API_KEY" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "What is the weather in Menlo Park?"},
+    ],
+    "model": "Llama-3.3-70B-Instruct",
+    "tools": [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Retrieve the current temperature for a specified location",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "The city, state, or country for which to fetch the temperature"
+                        }
+                    },
+                    "required": [
+                        "location"
+                    ],
+                    "additionalProperties": false
+                },
+                "strict": true
+            }
+        }
+    ]
+}'
+```
+Response
+```bash
+{
+  "completion_message": {
+    "content": {
+      "type": "text",
+      "text": ""
+    },
+    "role": "assistant",
+    "stop_reason": "tool_calls",
+    "tool_calls": [
+      {
+        "id": "466d49b7-8641-43bd-844e-ecac6a818974",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"location\":\"Menlo Park\"}"
+        }
+      }
+    ]
+  }
+}
+```
+
+# Setting up your environment
+
+- To use tool calling with Llama API, you'll need to set up authentication using your Llama API key, which you’ll store in an environment variable for now.
+
+- Here's how to set up your Python environment for making API calls:
+```python
+import os
+import requests
+import json
+
+os.environ["LLAMA_API_KEY"] = "your_api_key_here"
+
+# Load API key from environment variable
+LLAMA_API_KEY = os.environ.get('LLAMA_API_KEY')
+
+# Define the base URL
+BASE_URL = "https://api.llama.com/v1"
+
+get_weather_tool = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Retrieve the current temperature for a specified location",
+        "parameters": {
+        "properties": {
+            "location": {
+            "type": "string",
+            "description": "The city, state, or country for which to fetch the temperature"
+            }
+        },
+        "required": ["location"]
+        }
+    }
+}
+  
+headers = {
+	"Content-Type": "application/json",
+	"Authorization": f"Bearer {LLAMA_API_KEY}"
+}
+payload = {
+	"model": "Llama-3.3-8B-Instruct",
+	"messages": [
+		{"role": "user", "content": "What is the weather in Menlo Park?"}
+	],
+	"tools": [get_weather_tool],
+}
+    
+response = requests.post(
+	f"{BASE_URL}/chat/completions", 
+	headers=headers, 
+	json=payload
+)
+
+print(json.dumps(response.json(), indent=2))
+```
+
+# Creating a tool definition
+- The tool (singular) role is a special role that indicates to the model that the results come from an external tool. When the model uses a tool, it includes a tools (plural) field in the response. After you execute the tool call, return the results to the model using the tool role.
+## To instruct a Llama model on how to use a tool, create a tool definition that includes:
+•The tool’s name
+•A description of what the tool does
+•The parameters that the tool accepts
+
+- The chat completion API accepts a tools parameter, which is an array of tool definitions. This is separate from the messages parameter, which contains the conversation history. It is not necessary to include tool information in the system prompt, or even request that the model use tools at all. If tools are included, the model will by default use them if it decides they are necessary.
+
+```python
+get_weather_tool = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Retrieve the current temperature for a specified location",
+        "parameters": {
+        "properties": {
+            "location": {
+            "type": "string",
+            "description": "The city, state, or country for which to fetch the temperature"
+            }
+        },
+        "required": ["location"]
+        }
+    }
+}
+  
+headers = {
+	"Content-Type": "application/json",
+	"Authorization": f"Bearer {LLAMA_API_KEY}"
+}
+payload = {
+	"model": "Llama-3.3-8B-Instruct",
+	"messages": [
+		{"role": "user", "content": "What is the weather in Menlo Park?"}
+	],
+	"tools": [get_weather_tool],
+}
+    
+response = requests.post(
+	f"{BASE_URL}/chat/completions", 
+	headers=headers, 
+	json=payload
+)
+
+print(json.dumps(response.json(), indent=2))
+```
+JSON response
+
+```json
+  "completion_message": {
+    "content": {
+      "type": "text",
+      "text": ""
+    },
+    "role": "assistant",
+    "stop_reason": "tool_calls",
+    "tool_calls": [
+      {
+        "id": "bb3660bc-7992-4b0c-b1af-04aa424f559c",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"location\":\"Menlo Park, CA\"}"
+        }
+      }
+    ]
+  },
+  "metrics": [
+    {
+      "metric": "num_completion_tokens",
+      "value": 29,
+      "unit": "tokens"
+    },
+    {
+      "metric": "num_prompt_tokens",
+      "value": 752,
+      "unit": "tokens"
+    },
+    {
+      "metric": "num_total_tokens",
+      "value": 781,
+      "unit": "tokens"
+    }
+  ]
+}
+```
+
+# Invoking your tool
+- Llama API does not have access to any execution environment, and in many cases will not have access to the tool you have defined. Hence your application must execute the tool call generated by the model and return the results.
+
+- Return the results to the model using the tool role, as shown below.
+
+```python
+payload = {
+	"model": "Llama-3.3-8B-Instruct",
+	"messages": [
+		{"role": "user", "content": "What is the weather in Menlo Park?"},
+		{
+			"role": "assistant", "content": "", "stop_reason": "tool_calls",
+			"tool_calls": [{
+                "id": "bb3660bc-7992-4b0c-b1af-04aa424f559c",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"location\":\"Menlo Park, CA\"}"
+                }
+            }]
+		},
+		{
+			"role": "tool", 
+			"tool_call_id": "bb3660bc-7992-4b0c-b1af-04aa424f559c", 
+			"content": "{\"Menlo Park\": \"47f\"}"
+		}
+	],
+	"tools": [get_weather_tool],
+}
+    
+response = requests.post(
+	f"{BASE_URL}/chat/completions",
+	headers=headers, 
+	json=payload
+)
+  
+print(json.dumps(response.json(), indent=2))
+```
+
+```python
+{
+  "completion_message": {
+    "content": {
+      "type": "text",
+      "text": "The current temperature in Menlo Park is 47\u00b0F."
+    },
+    "role": "assistant",
+    "stop_reason": "stop",
+    "tool_calls": []
+  },
+  "metrics": [
+    {
+      "metric": "num_completion_tokens",
+      "value": 17,
+      "unit": "tokens"
+    },
+    {
+      "metric": "num_prompt_tokens",
+      "value": 796,
+      "unit": "tokens"
+    },
+    {
+      "metric": "num_total_tokens",
+      "value": 813,
+      "unit": "tokens"
+    }
+  ]
+}
+```
+
+# Testing & debugging
+- Because tool calls are executed outside of the model, you need to test and debug them separately. However, since there is no requirement to actually call the function, for testing purposes you can return a mock response with the output you expect from your tool. This means you can easily experiment with different tools before they are actually built, allowing you to iterate on your tool definitions and optimize your prompts prior to committing to development.
+- Sometimes, the model may not call the tool even if it is available. This is because the model may not believe that the tool is the best option for the user's request.
+
+To help the model call the right tool, you can try the following:
+•Provide some examples of how the tool should be used in the prompt
+•Modify the tool definition to include more specific instructions or examples
+•If you know the tool should be used, you can directly ask the model to use the tool in the prompt
+
+
+## Creating a tool definition
+The tool (singular) role is a special role that indicates to the model that the results come from an external tool. When the model uses a tool, it includes a tools (plural) field in the response. After you execute the tool call, return the results to the model using the tool role.
+To instruct a Llama model on how to use a tool, create a tool definition that includes:
+•The tool’s name
+•A description of what the tool does
+•The parameters that the tool accepts
+The chat completion API accepts a tools parameter, which is an array of tool definitions. This is separate from the messages parameter, which contains the conversation history. It is not necessary to include tool information in the system prompt, or even request that the model use tools at all. If tools are included, the model will by default use them if it decides they are necessary.
+Python
+```
+get_weather_tool = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Retrieve the current temperature for a specified location",
+        "parameters": {
+        "properties": {
+            "location": {
+            "type": "string",
+            "description": "The city, state, or country for which to fetch the temperature"
+```
+
+The model will use the provided tool definition to infer whether a tool should be invoked, then respond with a message indicating which tool it wants to use.
+JSON response
+```
+{
+  "completion_message": {
+    "content": {
+      "type": "text",
+      "text": ""
+    },
+    "role": "assistant",
+    "stop_reason": "tool_calls",
+    "tool_calls": [
+      {
+```
+
+Invoking your tool
+Llama API does not have access to any execution environment, and in many cases will not have access to the tool you have defined. Hence your application must execute the tool call generated by the model and return the results.
+
+Return the results to the model using the tool role, as shown below.
+Python
+
+```
+payload = {
+	"model": "Llama-3.3-8B-Instruct",
+	"messages": [
+		{"role": "user", "content": "What is the weather in Menlo Park?"},
+		{
+			"role": "assistant", "content": "", "stop_reason": "tool_calls",
+			"tool_calls": [{
+                "id": "bb3660bc-7992-4b0c-b1af-04aa424f559c",
+                "function": {
+                    "name": "get_weather",
+
+Consider using llama-stack-apps or another similar application to execute the tool call and retrieve the results.
+Finally, the model uses the results to return an answer to the original user question.
+JSON response
+{
+  "completion_message": {
+    "content": {
+      "type": "text",
+      "text": "The current temperature in Menlo Park is 47\u00b0F."
+    },
+    "role": "assistant",
+    "stop_reason": "stop",
+    "tool_calls": []
+  },
+
+Testing & debugging
+Because tool calls are executed outside of the model, you need to test and debug them separately. However, since there is no requirement to actually call the function, for testing purposes you can return a mock response with the output you expect from your tool. This means you can easily experiment with different tools before they are actually built, allowing you to iterate on your tool definitions and optimize your prompts prior to committing to development.
+Sometimes, the model may not call the tool even if it is available. This is because the model may not believe that the tool is the best option for the user's request.
+
+To help the model call the right tool, you can try the following:
+•Provide some examples of how the tool should be used in the prompt
+•Modify the tool definition to include more specific instructions or examples
+•If you know the tool should be used, you can directly ask the model to use the tool in the prompt
+Example tools
+Tool definitions are entirely up to you, and can be as specific or broad as you would like. Tools often correspond to a specific web API or service, but could also be used to call a library function or perform a calculation. Here are some examples of tools you might use with Llama.
+Search the web
+JSON
+12345678910111213141516
+{
+  "type": "function",
+  "function": {
+    "name": "web_search",
+    "description": "Search the web for information",
+    "parameters": {
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "The query to search for"
+
+Use Wolfram Alpha as a calculator
+JSON
+1234567891011121314
+{
+    "type": "function",
+    "function": {
+        "name": "calculate",
+        "description": "Complete mathematical calculations using Wolfram Alpha",
+        "properties": {
+            "expression": {
+                "type": "string",
+                "description": "The mathematical expression to evaluate"
+            }
+
+Was this page helpful?
+Introduction
+When to use tool calling
+How to use tool calling
+Testing & debugging
+Example tools

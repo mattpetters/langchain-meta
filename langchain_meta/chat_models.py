@@ -15,7 +15,10 @@ from typing import (
     Sequence,
     Type,
     Union,
+    Iterator,
+    AsyncIterator,
 )
+from operator import itemgetter
 
 from langchain_core.language_models.base import LanguageModelInput
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -28,8 +31,19 @@ from langchain_core.output_parsers.openai_tools import (
     JsonOutputKeyToolsParser,
     PydanticToolsParser,
 )
-from langchain_core.runnables import Runnable, RunnableLambda, RunnablePassthrough
+from langchain_core.runnables import (
+    Runnable,
+    RunnableLambda,
+    RunnablePassthrough,
+    RunnableMap,
+    RunnableBinding,
+)
 from langchain_core.tools import BaseTool
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_core.utils.pydantic import (
+    is_basemodel_subclass,
+    is_pydantic_v1_subclass,
+)
 from llama_api_client import AsyncLlamaAPIClient, LlamaAPIClient
 from llama_api_client.types.chat import (
     completion_create_params,
@@ -42,6 +56,7 @@ from pydantic import (
     ValidationError,
     ValidationInfo,
     field_validator,
+    ConfigDict,
 )
 
 # Import the mixin
@@ -78,6 +93,25 @@ LLAMA_KNOWN_MODELS = {
 }
 
 LLAMA_DEFAULT_MODEL_NAME = "Llama-4-Maverick-17B-128E-Instruct-FP8"
+
+from langchain_core.callbacks.manager import (
+    CallbackManagerForLLMRun,
+    AsyncCallbackManagerForLLMRun,
+)
+from langchain_core.outputs import ChatGenerationChunk
+
+
+# Custom PydanticToolsParser that raises errors instead of returning None
+class RaisingPydanticToolsParser(PydanticToolsParser):
+    def _parse_tool_call_error(
+        self,
+        tool_call_name: str,
+        tool_call_args: dict,
+        err: Exception,
+        schema: Any,
+    ) -> Any:
+        """Handle error when parsing tool call by raising the original error."""
+        raise err
 
 
 # STEEXZDdafsdfgasdfg
@@ -138,43 +172,49 @@ class ChatMetaLlama(SyncChatMetaLlamaMixin, AsyncChatMetaLlamaMixin, BaseChatMod
     _client: LlamaAPIClient | None = PrivateAttr(default=None)
     _async_client: AsyncLlamaAPIClient | None = PrivateAttr(default=None)
 
-    # Ensure Pydantic handles the default value if model_name is not provided.
-    # The field_validator can then focus on other forms of validation if needed.
+    # START_EDIT
+    # Revert to Pydantic fields with aliases
     model_name: Optional[str] = Field(default=LLAMA_DEFAULT_MODEL_NAME, alias="model")
+    temperature: Optional[float] = Field(default=None, alias="temperature")
+    max_tokens: Optional[int] = Field(default=None, alias="max_completion_tokens")
+    repetition_penalty: Optional[float] = Field(
+        default=None, alias="repetition_penalty"
+    )
 
-    # Optional parameters for the Llama API, with LangChain common names where applicable
-    temperature: Optional[float] = Field(default=None)  # Added default
-    max_tokens: Optional[int] = Field(
-        default=None, alias="max_completion_tokens"
-    )  # LangChain uses max_tokens
-    repetition_penalty: Optional[float] = Field(default=None)  # Added default
-
-    # API Key and Base URL for client initialization if client is not passed
     llama_api_key: Optional[SecretStr] = Field(default=None, alias="api_key")
     llama_api_url: Optional[str] = Field(default=None, alias="base_url")
+    # END_EDIT
 
     SUPPORTED_PARAMS: ClassVar[set] = {
-        "model",
+        "model",  # API expects "model"
         "messages",
         "temperature",
-        "max_completion_tokens",
+        "max_completion_tokens",  # API expects "max_completion_tokens"
         "tools",
         "stream",
         "repetition_penalty",
         "top_p",
         "top_k",
         "user",
-        "response_format",  # Added for structured output support
+        "response_format",
     }
 
-    model_config = {
-        "validate_assignment": True,
-        "validate_by_name": True,
+    lc_secrets: ClassVar[Dict[str, str]] = {
+        "llama_api_key": "LLAMA_API_KEY",  # Pydantic field name
     }
+
+    lc_attributes: ClassVar[Dict[str, Any]] = {}
+
+    model_config = ConfigDict(
+        validate_assignment=True,
+        populate_by_name=True,  # V2 equivalent of allow_population_by_field_name
+        extra="allow",
+    )
 
     def __init__(
         self,
         *,  # Make all args keyword-only
+        # __init__ params should match the Pydantic field names (pre-alias names)
         model_name: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
@@ -185,40 +225,128 @@ class ChatMetaLlama(SyncChatMetaLlamaMixin, AsyncChatMetaLlamaMixin, BaseChatMod
         async_client: Optional[AsyncLlamaAPIClient] = None,
         **kwargs: Any,
     ):
-        # If llama_api_key is not provided, try environment variables
-        if llama_api_key is None:
-            llama_api_key = os.environ.get("LLAMA_API_KEY") or os.environ.get(
-                "META_API_KEY"
-            )
+        # --- Temporary forceful logging setup ---
+        # import sys
+        #
+        # temp_logger = logging.getLogger("ChatMetaLlama_INIT_DEBUG")
+        # temp_logger.setLevel(logging.DEBUG)
+        # if not temp_logger.hasHandlers():
+        #     handler = logging.StreamHandler(sys.stdout)
+        #     handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+        #     temp_logger.addHandler(handler)
+        # --- End temporary logging setup ---
 
-        init_values = {
-            "model_name": model_name,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "repetition_penalty": repetition_penalty,
-            "llama_api_key": llama_api_key,
-            "llama_api_url": llama_api_url,
-            **kwargs,  # Pydantic will handle client/async_client if passed as kwargs due to field defs
+        # START_EDIT
+        # No need to map old names from kwargs if __init__ params are the old names.
+        # kwargs might contain aliased names if called with them, Pydantic V1 with populate_by_name handles this.
+        # However, env var lookup needs to be careful.
+        _model_name_resolved = model_name
+        _max_tokens_resolved = max_tokens
+        _llama_api_key_resolved = (
+            llama_api_key  # Will be converted to SecretStr later if string
+        )
+        _llama_api_url_resolved = llama_api_url  # Direct __init__ param
+
+        # Handle direct kwargs that might be aliases for a more robust init from dicts
+        if _model_name_resolved is None and "model" in kwargs:
+            _model_name_resolved = kwargs.pop("model")
+        if _max_tokens_resolved is None and "max_completion_tokens" in kwargs:
+            _max_tokens_resolved = kwargs.pop("max_completion_tokens")
+        if _llama_api_key_resolved is None and "api_key" in kwargs:
+            _llama_api_key_resolved = kwargs.pop("api_key")
+        if _llama_api_url_resolved is None and "base_url" in kwargs:
+            _llama_api_url_resolved = kwargs.pop("base_url")
+
+        # Environment variable lookup
+        if _llama_api_key_resolved is None:
+            # Prioritize LLAMA_API_KEY, then META_API_KEY
+            key_from_llama_env = os.environ.get("LLAMA_API_KEY")
+            key_from_meta_env = os.environ.get("META_API_KEY")
+            if key_from_llama_env:
+                _llama_api_key_resolved = key_from_llama_env
+            elif key_from_meta_env:
+                _llama_api_key_resolved = key_from_meta_env
+
+        if _llama_api_url_resolved is None:
+            url_from_llama_env = os.environ.get("LLAMA_API_URL")
+            url_from_meta_env = os.environ.get("META_API_BASE_URL")
+            if url_from_llama_env:
+                _llama_api_url_resolved = url_from_llama_env
+            elif url_from_meta_env:
+                _llama_api_url_resolved = url_from_meta_env
+
+        # Ensure model_name gets its default if still None.
+        # Pydantic's Field(default=...) for model_name handles cases where it's not provided.
+        # The validator for model_name also ensures a default if it becomes None post-init.
+        # The _model_name_resolved logic here tries to pre-apply the default if no input was given at all.
+        if (
+            model_name is None
+            and "model_name" not in kwargs
+            and "model" not in kwargs
+            and _model_name_resolved is None
+        ):
+            _model_name_resolved = LLAMA_DEFAULT_MODEL_NAME
+        # temp_logger.debug(
+        #     f"Pre-init_values: _llama_api_url_resolved='{_llama_api_url_resolved}', _llama_api_key_resolved type: {type(_llama_api_key_resolved)}"
+        # )
+
+        # Construct init_values using Pydantic field names as keys
+        init_values: Dict[str, Any] = {
+            "model_name": _model_name_resolved,
+            "temperature": temperature,  # Direct __init__ param
+            "max_tokens": _max_tokens_resolved,
+            "repetition_penalty": repetition_penalty,  # Direct __init__ param
+            # Ensure SecretStr conversion for llama_api_key before super().__init__
+            "llama_api_key": SecretStr(_llama_api_key_resolved)
+            if isinstance(_llama_api_key_resolved, str)
+            else _llama_api_key_resolved,
+            "llama_api_url": _llama_api_url_resolved,
         }
 
-        # Remove None values for fields where Pydantic should use its default
-        # or for fields that are truly optional and None is acceptable.
-        # For 'model_name', if it's None here, Pydantic will use its Field default.
+        # Add any other kwargs that were passed in (e.g., client, async_client, top_p)
+        # These might be Pydantic fields themselves if defined on the model, or go to __pydantic_extra__
+        init_values.update(kwargs)
+
+        # END_EDIT
+        # init_values_filtered = {k: v for k, v in init_values.items() if v is not None}
+        # The filtering of None values:
+        # If a field has default=None, passing {key: None} is fine.
+        # If a key is absent, Pydantic uses its default.
+        # Filtering out None means if a user explicitly passes temperature=None,
+        # it's treated as "not provided" rather than "explicitly None".
+        # For API params, sometimes "not provided" means "use client/API default",
+        # while "explicitly None" might be an error or mean something else.
+        # The original filtering was likely intentional for this reason. Let's keep it.
         init_values_filtered = {k: v for k, v in init_values.items() if v is not None}
 
-        # If model_name was explicitly passed as None, ensure it's not in filtered dict
-        # so pydantic uses the field's default. If it was not passed at all (not in kwargs),
-        # then it won't be in init_values_filtered either.
-        # If it was passed as a string, it will be in init_values_filtered.
-        if (
-            model_name is None and "model_name" in init_values_filtered
-        ):  # Should not happen if logic above is right
-            del init_values_filtered["model_name"]
+        # START_EDIT
+        # The SecretStr conversion for 'llama_api_key' is now handled directly during init_values construction.
+        # Old logic:
+        # if "llama_api_key" in init_values_filtered and isinstance(init_values_filtered["llama_api_key"], str):
+        #     init_values_filtered["llama_api_key"] = SecretStr(init_values_filtered["llama_api_key"])
+        # END_EDIT
 
         super().__init__(**init_values_filtered)
+        # temp_logger.debug(
+        #     f"Post-super().__init__(): self.llama_api_url='{self.llama_api_url}', self.llama_api_key type: {type(self.llama_api_key)}"
+        # )
 
-        # Assign explicitly passed clients to private attributes
-        # These are not Pydantic fields but are managed internally.
+        # START_EDIT: Explicitly set fields if Pydantic failed to from init_values_filtered
+        if self.llama_api_url is None and _llama_api_url_resolved is not None:
+            # temp_logger.debug(
+            #     f"llama_api_url is None and _resolved is not. Overwriting self.llama_api_url='{_llama_api_url_resolved}'"
+            # )
+            self.llama_api_url = _llama_api_url_resolved
+
+        _key_to_set = None
+        if isinstance(_llama_api_key_resolved, str):
+            _key_to_set = SecretStr(_llama_api_key_resolved)
+        elif isinstance(_llama_api_key_resolved, SecretStr):
+            _key_to_set = _llama_api_key_resolved
+
+        if self.llama_api_key is None and _key_to_set is not None:
+            self.llama_api_key = _key_to_set
+
         if client is not None:
             self._client = client
         if async_client is not None:
@@ -226,90 +354,87 @@ class ChatMetaLlama(SyncChatMetaLlamaMixin, AsyncChatMetaLlamaMixin, BaseChatMod
 
         self._ensure_client_initialized()
 
-    @field_validator("model_name", mode="before")
+    @field_validator("model_name", mode="before")  # Was model_name
     @classmethod
-    def validate_model_name(
+    def validate_model_name(  # Renamed for clarity, validates 'model' field
         cls, v: Any, info: ValidationInfo
-    ):  # Changed FieldValidationInfo to ValidationInfo
-        # This validator now primarily ensures that if a model_name is provided, it's valid.
-        # The default is handled by Pydantic's Field definition.
-        if v is None:  # If None comes in (e.g. explicit model_name=None)
-            # Pydantic should have already applied the default from Field() if no value was passed.
-            # If v is None here, it means it was EXPLICITLY passed as None.
-            # In this case, we let Pydantic's default mechanism (from Field) take over,
-            # or if the field were truly Optional without a default, None would be fine.
-            # Given our Field has a default, this path implies we want that default.
-            # Returning None here will let Pydantic use the Field default.
-            return None  # Allow Pydantic to use Field's default
+    ):
+        if v is None:
+            # Allow None to pass through if the field is Optional and default=None applies
+            # For model_name, Field has default=LLAMA_DEFAULT_MODEL_NAME, so it won't be None unless explicitly set.
+            # If it were Field(default=None, ...) this would be critical.
+            # Here, if v is None it means it was explicitly passed as None, overriding the Field default.
+            # The Pydantic Field default (LLAMA_DEFAULT_MODEL_NAME) only applies if the key is missing or value is Undefined,
+            # not if value is None.
+            # So, if we get None here, we should probably still default it, or the __init__ logic
+            # already defaulted _model_name_resolved if the input `model_name` param was None.
+            # The current __init__ ensures _model_name_resolved gets LLAMA_DEFAULT_MODEL_NAME if initial param is None.
+            # So v here should not be None if that logic holds.
+            # However, if someone does chat_model.model_name = None, this validator runs.
+            default_model = LLAMA_DEFAULT_MODEL_NAME
+            logger.warning(f"model_name was None, defaulting to {default_model}")
+            return default_model
 
         v_str = str(v).strip()
-        if not v_str:  # If it's an empty string after strip
-            # If an empty string was explicitly passed, fall back to default.
-            default_model = LLAMA_DEFAULT_MODEL_NAME  # Field default won't be used if empty str passed
-            logger.warning(f"model_name was empty. Defaulting to {default_model}")
+        if not v_str:
+            default_model = LLAMA_DEFAULT_MODEL_NAME
+            logger.warning(
+                f"model (model_name) was empty. Defaulting to {default_model}"
+            )
             return default_model
 
         if v_str not in LLAMA_KNOWN_MODELS:
             warnings.warn(
-                f"Model \\'{v_str}\\' is not in the list of known Llama models.\\n"
-                f"Known models: {', '.join(LLAMA_KNOWN_MODELS.keys())}\\n"
-                "Your model may still work if the Meta API accepts it, but hasn\\'t been tested."
+                f"Model '{v_str}' is not in the list of known Llama models.\n"
+                f"Known models: {', '.join(LLAMA_KNOWN_MODELS.keys())}\n"
+                "Your model may still work if the Meta API accepts it, but hasn't been tested."
             )
         return v_str
 
     @property
     def _llm_type(self) -> str:
-        """Return type of chat model."""
-        return "chat-meta-llama"
+        return "meta-llama"
 
     @property
     def client(self) -> LlamaAPIClient | None:
-        """Provides access to the LlamaAPIClient instance."""
         return self._client
 
     @property
     def _identifying_params(self) -> Dict[str, Any]:
-        """Get the identifying parameters."""
-        # Direct access should now yield plain values.
-        return {
+        # START_EDIT
+        # Uses new field names
+        params = {
             "model_name": self.model_name,
             "temperature": self.temperature,
-            "max_completion_tokens": self.max_tokens,
+            "max_tokens": self.max_tokens,
             "repetition_penalty": self.repetition_penalty,
         }
+        if self.llama_api_url is not None:
+            params["llama_api_url"] = self.llama_api_url
+        return params
 
     def _ensure_client_initialized(self) -> None:
-        # Retrieve the plain string API key from the SecretStr field.
+        # Uses new field names api_key (SecretStr) and base_url (str)
         key_val = self.llama_api_key.get_secret_value() if self.llama_api_key else None
-
-        # self.llama_api_url is a string field with a Pydantic default.
-        url_val = self.llama_api_url  # Corrected from llama_base_url
+        url_val = self.llama_api_url
 
         if self._client is None:
-            if not key_val:  # Check the actual string value of the key
-                # Log instead of raising, to match previous behavior pattern for missing optional clients
+            if not key_val:
                 logger.warning(
-                    "LlamaAPIClient: API key is missing or empty. "
-                    "Sync client cannot be initialized."
+                    "LlamaAPIClient: API key is missing. Sync client cannot be initialized."
                 )
             else:
-                logger.debug("Instantiating LlamaAPIClient for ChatMetaLlama...")
                 self._client = LlamaAPIClient(api_key=key_val, base_url=url_val)
-                logger.info("LlamaAPIClient for ChatMetaLlama instantiated.")
-
+        # ... similar for _async_client
         if self._async_client is None:
-            if not key_val:  # Check the actual string value of the key
-                # Log instead of raising, to match previous behavior pattern for missing optional clients
+            if not key_val:
                 logger.warning(
-                    "AsyncLlamaAPIClient: API key is missing or empty. "
-                    "Async client cannot be initialized."
+                    "AsyncLlamaAPIClient: API key is missing. Async client cannot be initialized."
                 )
             else:
-                logger.debug("Instantiating AsyncLlamaAPIClient for ChatMetaLlama...")
                 self._async_client = AsyncLlamaAPIClient(
                     api_key=key_val, base_url=url_val
                 )
-                logger.info("AsyncLlamaAPIClient for ChatMetaLlama instantiated.")
 
     def _detect_supervisor_request(self, messages: List[BaseMessage]) -> bool:
         """Detect if this looks like a supervisor routing request.
@@ -336,86 +461,87 @@ class ChatMetaLlama(SyncChatMetaLlamaMixin, AsyncChatMetaLlamaMixin, BaseChatMod
         stream: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Prepares API parameters for a chat completion request."""
-        api_params: Dict[str, Any] = {
-            "model": self.model_name,
-            "messages": [
-                _lc_message_to_llama_message_param(m) for m in messages
-            ],  # Convert messages properly
-            "stream": stream,
+        """Prepare parameters for the Llama API call.
+
+        Args:
+            messages: List of LangChain BaseMessages.
+            tools: Optional list of Llama API formatted tools.
+            stop: Optional list of stop sequences.
+            stream: Boolean indicating if streaming is enabled.
+            **kwargs: Additional keyword arguments for the API.
+
+        Returns:
+            A dictionary of parameters for the Llama API.
+        """
+        # Convert LangChain messages to Llama API message format
+        # Pass the Llama-formatted tools (self.tools or tools from kwargs) to assist with argument coercion
+        llama_messages = [
+            _lc_message_to_llama_message_param(m, available_tools_with_schema=tools)
+            for m in messages
+        ]
+
+        # Remove tool_choice from kwargs as it's not supported by Llama API directly
+        # and would cause an error if passed to llama-api-client
+        if "tool_choice" in kwargs:
+            logger.debug(
+                f"Llama API does not support 'tool_choice'. Removing '{kwargs['tool_choice']}' from API call."
+            )
+            kwargs.pop("tool_choice")
+
+        # Construct the base parameters
+        params: Dict[str, Any] = {
+            "model": self.model_name
+            or LLAMA_DEFAULT_MODEL_NAME,  # Use alias-resolved name
+            "messages": llama_messages,
         }
 
-        # Add parameters from instance, potentially overridden by kwargs
+        # Add optional parameters from self or kwargs
+        # Temperature
         if self.temperature is not None:
-            api_params["temperature"] = self.temperature
-        if self.repetition_penalty is not None:
-            api_params["repetition_penalty"] = self.repetition_penalty
+            params["temperature"] = self.temperature
+        elif "temperature" in kwargs:
+            params["temperature"] = kwargs["temperature"]
 
-        # Explicitly add/override parameters from kwargs if provided and supported
-        for key in ["temperature", "repetition_penalty", "top_p", "top_k", "user"]:
-            if key in kwargs:
-                api_param_name = key
-                # Check if the parameter is generally supported by the ChatMetaLlama class
-                # before adding it to API params. Note: This still relies on SUPPORTED_PARAMS
-                # which includes max_completion_tokens, but we are manually excluding it here.
-                if api_param_name in self.SUPPORTED_PARAMS:
-                    api_params[api_param_name] = kwargs.pop(key)
-
-        # Handle max_tokens (alias max_completion_tokens for Llama API)
-        # Prefer max_tokens from direct call (via kwargs) > self.max_tokens
-        max_tokens_val = kwargs.pop("max_tokens", self.max_tokens)
+        # Max tokens (Llama API expects max_completion_tokens)
+        max_tokens_val = kwargs.get(
+            "max_tokens", kwargs.get("max_completion_tokens", self.max_tokens)
+        )
         if max_tokens_val is not None:
-            api_params["max_completion_tokens"] = max_tokens_val
+            params["max_completion_tokens"] = max_tokens_val
 
-        # Add tools if provided
+        # Repetition Penalty
+        repetition_penalty_val = kwargs.get(
+            "repetition_penalty", self.repetition_penalty
+        )
+        if repetition_penalty_val is not None:
+            params["repetition_penalty"] = repetition_penalty_val
+
+        # Tools
         if tools:
-            api_params["tools"] = tools
-            # If tools are present and no specific tool_choice is given, set to "auto"
-            # to encourage the model to use the tools.
+            params["tools"] = tools
+
+        # Streaming
+        if stream:
+            params["stream"] = True
+
+        # Add any other supported kwargs directly
+        for k, v in kwargs.items():
             if (
-                "tool_choice" not in api_params
-                and kwargs.get("tool_choice", None) is None
-            ):
-                api_params["tool_choice"] = "auto"
-                logger.debug(
-                    "Set tool_choice='auto' as tools are present and no specific choice was made."
-                )
+                k in self.SUPPORTED_PARAMS and k not in params
+            ):  # Avoid overwriting already set params
+                params[k] = v
+            elif k not in self.SUPPORTED_PARAMS and k not in [
+                "max_tokens",
+                "tools",
+            ]:
+                logger.debug(f"Ignoring unsupported Llama API parameter: {k}")
 
-        # Add stop if provided
-        if stop:
-            api_params["stop"] = stop
-
-        # Add response_format if provided (for structured output)
-        if "response_format" in kwargs:
-            # Meta uses response_format parameter for json_schema output
-            api_params["response_format"] = kwargs.pop("response_format")
-
-        # Check for any remaining kwargs that are not supported and warn
-        # Add max_tokens explicitly to the list of ignored keys here since it's a known unsupported param for the client
-        IGNORED_PARAMS = [
-            "client",
-            "async_client",
-            "run_manager",
-            "callbacks",
-            "max_tokens",
-            "system_prompt",  # Handled via messages, not directly
-        ]
-        for key in kwargs.keys():
-            # Also check if the key is in SUPPORTED_PARAMS but is one we are explicitly excluding for this client version
-            if key not in self.SUPPORTED_PARAMS and key not in IGNORED_PARAMS:
-                logger.warning(
-                    f"Unsupported parameter passed to API call: {key}. It will be ignored."
-                )
-
-        # Ensure tool_choice is never sent to the Llama API endpoint
-        api_params.pop("tool_choice", None)
-
-        return api_params
+        return params
 
     def _get_invocation_params(self, **kwargs: Any) -> Dict[str, Any]:
         """Gets the parameters for a chat completion invocation."""
         return {
-            "model": self.model_name,
+            "model_name": self.model_name,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "repetition_penalty": self.repetition_penalty,
@@ -478,160 +604,116 @@ class ChatMetaLlama(SyncChatMetaLlamaMixin, AsyncChatMetaLlamaMixin, BaseChatMod
 
     def with_structured_output(
         self,
-        schema: Union[Dict, Type[BaseModel]],
+        schema: Any,
         *,
-        method: Literal["function_calling", "json_mode"] = "function_calling",
+        method: str = "function_calling",
         include_raw: bool = False,
-        **kwargs: Any,
-    ) -> Runnable[LanguageModelInput, Union[Dict, BaseModel]]:
-        """
-        Return a new runnable that returns a structured output.
+        strict: Optional[bool] = None,
+        **other_kwargs: Any,
+    ) -> Runnable:
+        if other_kwargs:
+            raise ValueError(f"Received unsupported arguments {other_kwargs}")
 
-        Args:
-            schema: The Pydantic model or JSON schema to use for structured output.
-            method: The method to use for structured output. Options:
-                - 'function_calling': Use tool/function calling format (adapted for Meta).
-                                      The prompt should guide the model to use the tool.
-                - 'json_mode': Use Meta's native json_schema response_format.
-                               The prompt must explicitly ask for JSON output matching the schema.
-            include_raw: Whether to include the raw LLM output in the result.
-            **kwargs: Additional keyword arguments to pass to the LLM.
-
-        Returns:
-            A runnable that outputs structured data.
-        """
-        schema_name: str
-        schema_dict: Dict
-
-        if isinstance(schema, type) and issubclass(schema, BaseModel):
-            schema_name = schema.__name__
-            schema_dict = schema.model_json_schema()
-        elif isinstance(schema, dict):
-            schema_name = schema.get("name", schema.get("title", "OutputSchema"))
-            schema_dict = schema
-        else:
-            raise ValueError(f"Unsupported schema type: {type(schema)}")
-
-        # Default temperature for structured output if not provided in kwargs
-        if "temperature" not in kwargs:
-            kwargs["temperature"] = 0.1
-
-        llm_for_binding: BaseChatModel = self
-        llm_with_schema_binding: Runnable[LanguageModelInput, BaseMessage]
-
-        if method == "json_mode":
-            logger.debug(
-                f"Binding 'response_format' for Meta's json_schema mode with schema '{schema_name}'"
-            )
-            # For json_mode, the prompt given to the LLM must instruct it to produce JSON.
-            # We bind the response_format parameter to tell the Llama API to enforce schema.
-            if (
-                "system_prompt" in kwargs
-            ):  # system_prompt is not a direct API kwarg for bind
-                logger.warning(
-                    "'system_prompt' kwarg to 'with_structured_output' with 'json_mode' is not "
-                    "directly bound as an API parameter. It should be part of input messages."
-                )
-                kwargs.pop("system_prompt", None)
-
-            bound_params = {
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        # "name": schema_name, # Name is not part of Meta's spec for json_schema content here
-                        "schema": schema_dict,
-                    },
-                },
-                **kwargs,  # Other kwargs like temperature
+        # Prepare the special kwargs for bind_tools that test callbacks expect
+        bind_kwargs_for_structured_output = {
+            "ls_structured_output_format": {
+                "kwargs": {"method": method, "strict": strict},
+                "schema": schema,
             }
-            llm_with_schema_binding = llm_for_binding.bind(**bound_params)
+        }
 
-        elif method == "function_calling":
-            tool_definition = {
-                "type": "function",
-                "function": {
-                    "name": schema_name,
-                    "description": schema_dict.get(
-                        "description", f"Schema for {schema_name}"
-                    ),
-                    "parameters": schema_dict,
-                },
-            }
-            logger.debug(
-                f"Binding 'tools' for function calling with schema '{schema_name}'"
-            )
-            if (
-                "system_prompt" in kwargs
-            ):  # system_prompt is not a direct API kwarg for bind
-                logger.warning(
-                    "'system_prompt' kwarg to 'with_structured_output' with 'function_calling' is not "
-                    "directly bound as an API parameter. It should be part of input messages."
+        if method == "function_calling":
+            # tool_choice="any" is a hint, Llama is model-driven.
+            # Binding the single schema makes it the only choice if the model uses tools.
+            llm = self.bind_tools([schema], **bind_kwargs_for_structured_output)
+            if is_basemodel_subclass(schema):
+                parser: Any = PydanticToolsParser(tools=[schema], first_tool_only=True)
+            else:
+                key_name = convert_to_openai_tool(schema)["function"]["name"]
+                parser = JsonOutputKeyToolsParser(
+                    key_name=key_name, first_tool_only=True
                 )
-                kwargs.pop("system_prompt", None)
-
-            llm_with_schema_binding = llm_for_binding.bind(
-                tools=[tool_definition], **kwargs
+        elif method == "json_mode":
+            warnings.warn(
+                "JSON mode for ChatMetaLlama's with_structured_output might not be fully "
+                "implemented to Llama API's native JSON mode yet. "
+                "Falling back to function_calling behavior for tool binding."
             )
+            # For Llama, json_mode might mean setting response_format directly.
+            # However, to use existing parsers that expect tool calls, we still bind the schema as a tool.
+            # The actual API call in _prepare_api_params would need to set response_format for true json_mode.
+            llm = self.bind_tools([schema], **bind_kwargs_for_structured_output)
+            if is_basemodel_subclass(schema):
+                parser = PydanticToolsParser(tools=[schema], first_tool_only=True)
+            else:
+                key_name = convert_to_openai_tool(schema)["function"]["name"]
+                parser = JsonOutputKeyToolsParser(
+                    key_name=key_name, first_tool_only=True
+                )
+        elif method == "json_schema":
+            warnings.warn(
+                "json_schema method for with_structured_output is not standardly "
+                "supported by Llama API in the same way as OpenAI. "
+                "Falling back to function_calling behavior for tool binding."
+            )
+            llm = self.bind_tools([schema], **bind_kwargs_for_structured_output)
+            if is_basemodel_subclass(schema):
+                parser = PydanticToolsParser(tools=[schema], first_tool_only=True)
+            else:
+                key_name = convert_to_openai_tool(schema)["function"]["name"]
+                parser = JsonOutputKeyToolsParser(
+                    key_name=key_name, first_tool_only=True
+                )
         else:
-            raise ValueError(f"Unsupported method for structured output: {method}")
-
-        # Setup appropriate output parser
-        output_parser: Runnable[BaseMessage, Union[Dict, BaseModel]]
-        if method == "json_mode":
-
-            def _parse_json_output(
-                message: BaseMessage,
-            ) -> Union[Dict, BaseModel]:
-                if not isinstance(message, AIMessage):
-                    raise TypeError(
-                        f"Expected AIMessage for json_mode parsing, got {type(message)}"
-                    )
-                json_string = message.content
-                if not isinstance(json_string, str) or not json_string.strip():
-                    # If content is not a non-empty string, attempt to dump if dict/list, else error
-                    if isinstance(json_string, (dict, list)):
-                        try:
-                            json_string = json.dumps(json_string)
-                        except TypeError as e:
-                            raise ValueError(
-                                f"AIMessage content is not a JSON string or serializable: {json_string}, error: {e}"
-                            )
-                    else:
-                        raise ValueError(
-                            f"AIMessage content is not a JSON string for json_mode: {json_string}"
-                        )
-
-                try:
-                    if isinstance(schema, type) and issubclass(schema, BaseModel):
-                        return schema.parse_raw(json_string)
-                    else:  # dict schema
-                        return json.loads(json_string)
-                except (
-                    json.JSONDecodeError,
-                    ValidationError,
-                ) as e:  # ValidationError from Pydantic
-                    logger.error(
-                        f"Failed to parse JSON output for schema '{schema_name}': {e}. Content: '{json_string}'"
-                    )
-                    raise ValueError(
-                        f"Output could not be parsed as {schema_name}: {e}. Received: '{json_string}'"
-                    )
-
-            output_parser = RunnableLambda(_parse_json_output)
-        else:  # function_calling
-            if isinstance(schema, type) and issubclass(schema, BaseModel):
-                output_parser = PydanticToolsParser(
-                    tools=[schema], first_tool_only=True
-                )
-            else:  # dict schema
-                output_parser = JsonOutputKeyToolsParser(
-                    key_name=schema_name, first_tool_only=True, return_single=True
-                )
+            raise ValueError(
+                f"Unsupported method {method}. Must be one of 'function_calling', 'json_mode', 'json_schema'."
+            )
 
         if include_raw:
-            # Assigns the parsed output to a "parsed" key in the output dict
-            return llm_with_schema_binding | RunnablePassthrough.assign(
-                parsed=output_parser
+            parser_with_raw: Runnable = RunnablePassthrough.assign(
+                parsed=itemgetter("parsed") | parser, raw=itemgetter("raw")
+            )
+            return (
+                {"input": RunnablePassthrough()}
+                | RunnableMap(raw=llm, parsed=llm)
+                | parser_with_raw
             )
         else:
-            return llm_with_schema_binding | output_parser
+            return llm | parser
+
+    def _stream(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        """Stream chat messages, returning an iterator of ChatGenerationChunks."""
+        # START_EDIT
+        # Explicitly call the mixin's method
+        return SyncChatMetaLlamaMixin._stream(
+            self, messages=messages, stop=stop, run_manager=run_manager, **kwargs
+        )
+        # END_EDIT
+
+    async def _astream(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        """Asynchronously stream chat messages, returning an async iterator of ChatGenerationChunks."""
+        # START_EDIT
+        # Explicitly iterate and yield from the mixin's async generator.
+        # This ensures that ChatMetaLlama._astream itself is unequivocally an async generator.
+        async for chunk in AsyncChatMetaLlamaMixin._astream(
+            self, messages=messages, stop=stop, run_manager=run_manager, **kwargs
+        ):
+            yield chunk
+        # END_EDIT
+
+    @classmethod
+    def is_lc_serializable(cls) -> bool:
+        """Return whether this model can be serialized by Langchain standard methods."""
+        return True

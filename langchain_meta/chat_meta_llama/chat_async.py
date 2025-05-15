@@ -1,7 +1,7 @@
 import json
 import logging
-import uuid
 import re
+import uuid
 from datetime import datetime
 from typing import (
     Any,
@@ -20,17 +20,20 @@ from langchain_core.callbacks.manager import AsyncCallbackManagerForLLMRun
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
-    BaseMessage,  # Used by _detect_supervisor_request if that were moved, but it's on self
+    BaseMessage,  # Used by _detect_supervisor_request if that were moved, but it's on self,
     ToolCallChunk,
+    HumanMessage,
+    SystemMessage,
 )
 from langchain_core.messages.ai import UsageMetadata
 from langchain_core.outputs import (
     ChatGeneration,
     ChatGenerationChunk,
     ChatResult,
-    LLMResult,
     Generation,
+    LLMResult,
 )
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from llama_api_client import AsyncLlamaAPIClient
 from llama_api_client.types.chat import (
@@ -40,6 +43,7 @@ from llama_api_client.types.create_chat_completion_response import (
     CreateChatCompletionResponse,
 )
 from pydantic import BaseModel
+from langchain_core.utils.function_calling import convert_to_openai_tool
 
 # Assuming chat_models.py is in langchain_meta.chat_models
 # Adjust the import path if necessary based on your project structure.
@@ -47,7 +51,6 @@ from .serialization import (
     _lc_tool_to_llama_tool_param,
     _parse_textual_tool_args,
 )  # Changed from ..chat_models
-from ..utils import parse_malformed_args_string  # Import from main utils
 
 logger = logging.getLogger(__name__)
 
@@ -98,13 +101,44 @@ class AsyncChatMetaLlamaMixin:
         self._ensure_client_initialized()
         if not self._async_client:
             raise ValueError(
-                "Async client not initialized. Call \\`async_init_clients\\` first."
+                "Async client not initialized. Call `async_init_clients` first."
             )
         async_client_to_use = self._async_client
 
         prompt_tokens = 0
         completion_tokens = 0
         start_time = datetime.now()
+
+        # Prepare callback options
+        callback_options = {}
+
+        # Check for structured output format in run_metadata
+        if "run_metadata" in kwargs and isinstance(kwargs["run_metadata"], dict):
+            run_metadata = kwargs["run_metadata"]
+            if "ls_structured_output_format" in run_metadata:
+                callback_options["ls_structured_output_format"] = run_metadata[
+                    "ls_structured_output_format"
+                ]
+
+        # Also check directly in kwargs (for backward compatibility)
+        if "ls_structured_output_format" in kwargs:
+            callback_options["ls_structured_output_format"] = kwargs[
+                "ls_structured_output_format"
+            ]
+
+        # Start the run if we have a manager
+        if run_manager and hasattr(run_manager, "on_llm_start"):
+            try:
+                # Pass options to callback
+                on_llm_start_fn = getattr(run_manager, "on_llm_start")
+                await on_llm_start_fn(
+                    {"name": self.__class__.__name__},
+                    messages,
+                    invocation_params=self._get_invocation_params(**kwargs),
+                    options=callback_options,
+                )
+            except Exception as e:
+                logger.warning(f"Error in on_llm_start callback: {str(e)}")
 
         if tool_choice is not None and "tool_choice" not in kwargs:
             kwargs["tool_choice"] = tool_choice
@@ -205,7 +239,6 @@ class AsyncChatMetaLlamaMixin:
                 except (AttributeError, TypeError, KeyError):
                     pass
 
-        # If still no content but we have response data, traverse known structures - attempt 3
         if not content_str and hasattr(call_result, "to_dict"):
             try:
                 full_result = call_result.to_dict()
@@ -220,7 +253,6 @@ class AsyncChatMetaLlamaMixin:
                             elif isinstance(content, str):
                                 content_str = content
 
-                    # If there's still no content but response_metadata exists and has completion_message
                     if not content_str and "response_metadata" in full_result:
                         response_meta = full_result["response_metadata"]
                         if (
@@ -541,152 +573,467 @@ class AsyncChatMetaLlamaMixin:
         # This is a simplified approach for now: we look for full textual tool calls in each chunk's content
         # A more robust solution would buffer across chunks if a textual call is split.
 
+        # New approach for async: Keep track of active tool calls by index
+        active_tool_streams_by_index_async: Dict[int, Dict[str, Any]] = {}
+
         current_tool_call_index = (
             0  # To assign index for AIMessageChunk tool_call_chunks
         )
 
-        async for chunk in await active_client.chat.completions.create(**api_params):
-            logger.debug(f"Llama API (async stream) Stream Chunk: {chunk.to_dict()}")
-            chunk_dict = chunk.to_dict()
-            content_str = ""
+        cumulative_usage_for_gen_info: Dict[
+            str, Any
+        ] = {  # For ChatGeneration.generation_info
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
 
-            # Enhanced content extraction for streaming chunks (existing logic)
-            if hasattr(chunk, "completion_message") and chunk.completion_message:
-                completion_msg = chunk.completion_message
-                if hasattr(completion_msg, "content") and completion_msg.content:
-                    content = completion_msg.content
-                    if isinstance(content, dict) and "text" in content:
-                        content_str = content["text"]
-                    elif isinstance(content, str):
-                        content_str = content
-                if not content_str and hasattr(completion_msg, "to_dict"):
-                    try:
-                        msg_dict = completion_msg.to_dict()
-                        if isinstance(msg_dict, dict) and "content" in msg_dict:
-                            content_dict = msg_dict["content"]
-                            if (
-                                isinstance(content_dict, dict)
-                                and "text" in content_dict
-                            ):
-                                content_str = content_dict["text"]
-                            elif isinstance(content_dict, str):
-                                content_str = content_dict
-                    except (AttributeError, TypeError, KeyError):
-                        pass
-            if not content_str and chunk_dict:
-                try:
-                    if "completion_message" in chunk_dict:
-                        comp_msg = chunk_dict["completion_message"]
-                        if isinstance(comp_msg, dict) and "content" in comp_msg:
-                            content = comp_msg["content"]
-                            if isinstance(content, dict) and "text" in content:
-                                content_str = content["text"]
-                            elif isinstance(content, str):
-                                content_str = content
-                    if not content_str and "response_metadata" in chunk_dict:
-                        # ... (existing deeper content extraction)
-                        pass  # Assume existing deeper extraction handles this if needed
-                except (KeyError, TypeError):
-                    pass
+        # Add a flag to track if we yielded any chunks
+        yielded_any_chunk = False
+        stream_failed = False  # Flag to indicate if streaming operation itself failed
 
-            generation_info: Dict[str, Any] = {}  # Initialize for current chunk
-            if hasattr(chunk, "stop_reason") and chunk.stop_reason:
-                generation_info["finish_reason"] = chunk.stop_reason
-            elif (
-                hasattr(chunk, "finish_reason") and chunk.finish_reason
-            ):  # Some Llama client versions might use this
-                generation_info["finish_reason"] = chunk.finish_reason
-
-            if chunk_dict.get("x_request_id"):
-                generation_info["x_request_id"] = chunk_dict.get("x_request_id")
-            if hasattr(chunk, "usage") and chunk.usage:
-                generation_info["chunk_usage"] = chunk.usage.to_dict()
-
-            # Process native tool calls from the API chunk first
-            chunk_tool_calls_for_aimc_obj: List[ToolCallChunk] = []
-            if (
-                isinstance(chunk.message, AIMessageChunk)
-                and chunk.message.tool_call_chunks
+        try:
+            async for raw_api_chunk in await active_client.chat.completions.create(
+                **api_params
             ):
-                for tc_chunk_dict in chunk.message.tool_call_chunks:
-                    try:
-                        # Construct ToolCallChunk objects
-                        chunk_tool_calls_for_aimc_obj.append(
-                            ToolCallChunk(
-                                name=tc_chunk_dict.get("name"),
-                                args=tc_chunk_dict.get("args", ""),
-                                id=tc_chunk_dict.get("id"),
-                                index=tc_chunk_dict.get("index"),
-                            )
-                        )
-                    except Exception as e:
-                        logger.warning(f"Could not construct ToolCallChunk: {e}")
-
-            # Fallback: If no native tool calls in this chunk, try to parse from content_str
-            if not chunk_tool_calls_for_aimc_obj and prepared_llm_tools and content_str:
-                match = re.fullmatch(
-                    r"\s*\[\s*([a-zA-Z0-9_]+)\s*(?:\(\s*(.*?)\s*\))?\s*\]\s*",
-                    content_str,
+                logger.debug(
+                    f"Llama API (async stream) Stream Chunk: {raw_api_chunk.to_dict()}"
                 )
-                if match:
-                    tool_name_from_content = match.group(1)
-                    args_str_from_content = match.group(
-                        2
-                    )  # This is a string, possibly JSON or empty
+                raw_api_chunk_dict = raw_api_chunk.to_dict()
 
-                    available_tool_names = [
-                        t["function"]["name"]
-                        for t in prepared_llm_tools
-                        if isinstance(t, dict)
-                        and "function" in t
-                        and "name" in t["function"]
-                    ]
-                    if tool_name_from_content in available_tool_names:
-                        logger.info(
-                            f"Parsed textual tool call for '{tool_name_from_content}' from stream chunk content."
+                event_data = getattr(raw_api_chunk, "event", None)
+                event_type = getattr(event_data, "event_type", None)
+                event_delta = getattr(event_data, "delta", None)
+                event_metrics_list = getattr(event_data, "metrics", None)
+                chunk_stop_reason = getattr(raw_api_chunk, "stop_reason", None)
+                event_stop_reason = getattr(event_data, "stop_reason", None)
+                final_stop_reason = event_stop_reason or chunk_stop_reason
+
+                current_gen_info: Dict[str, Any] = {"model_name": self.model_name}
+                if final_stop_reason:
+                    current_gen_info["finish_reason"] = final_stop_reason
+                if raw_api_chunk_dict.get("x_request_id"):
+                    current_gen_info["x_request_id"] = raw_api_chunk_dict.get(
+                        "x_request_id"
+                    )
+
+                parsed_tool_call_chunks_for_current_raw_chunk: List[ToolCallChunk] = []
+
+                # Attempt to parse tool calls from event.delta if it indicates a tool_call
+                if event_delta and getattr(event_delta, "type", None) == "tool_call":
+                    tc_obj = event_delta
+                    tool_call_id_from_delta = getattr(tc_obj, "id", None)
+                    tool_function = getattr(tc_obj, "function", None)
+                    tool_name_from_delta = (
+                        getattr(tool_function, "name", None) if tool_function else None
+                    )
+                    tool_args_str_from_delta = (
+                        getattr(tool_function, "arguments", "") or ""
+                    )
+                    tool_index_from_delta = getattr(tc_obj, "index", 0)
+
+                    if tool_call_id_from_delta and tool_name_from_delta:
+                        active_tool_streams_by_index_async[tool_index_from_delta] = {
+                            "id": tool_call_id_from_delta,
+                            "name": tool_name_from_delta,
+                            "args_buffer": tool_args_str_from_delta,
+                        }
+                        logger.debug(
+                            f"_astream (async): Started/updated tool stream for index {tool_index_from_delta}: id={tool_call_id_from_delta}, name={tool_name_from_delta}"
                         )
-                        tool_call_id = str(uuid.uuid4())
-
-                        # Use the new robust parser for args string
-                        # However, for ToolCallChunk, args should be the string delta
-                        # _parse_textual_tool_args(args_str_from_content) # We still call it to validate/log if needed
-
-                        # For AIMessageChunk, 'args' should be the string delta.
-                        # If args_str_from_content is None (e.g. [tool_name()]), pass empty string for args.
-                        args_for_chunk_str = (
-                            args_str_from_content
-                            if args_str_from_content is not None
-                            else ""
-                        )
-
-                        chunk_tool_calls_for_aimc_obj.append(
+                        parsed_tool_call_chunks_for_current_raw_chunk.append(
                             ToolCallChunk(
-                                name=tool_name_from_content,
-                                args=args_for_chunk_str,  # Use the original string delta
-                                id=tool_call_id,
-                                index=current_tool_call_index,  # Assign current index
+                                name=tool_name_from_delta,
+                                args=tool_args_str_from_delta,
+                                id=tool_call_id_from_delta,
+                                index=tool_index_from_delta,
                             )
                         )
-                        current_tool_call_index += 1
-                        content_str = ""  # Clear content as it's now a tool call
-                        generation_info["finish_reason"] = (
-                            "tool_calls"  # Mark finish reason
+                    elif tool_index_from_delta in active_tool_streams_by_index_async:
+                        stored_tool_info = active_tool_streams_by_index_async[
+                            tool_index_from_delta
+                        ]
+                        stored_tool_info["args_buffer"] += tool_args_str_from_delta
+                        logger.debug(
+                            f"_astream (async): Appending args to tool stream for index {tool_index_from_delta}: id={stored_tool_info['id']}, name={stored_tool_info['name']}"
+                        )
+                        parsed_tool_call_chunks_for_current_raw_chunk.append(
+                            ToolCallChunk(
+                                name=None,  # Name/ID can be None for arg delta if index is present
+                                args=tool_args_str_from_delta,
+                                id=None,  # Will be aggregated later using index
+                                index=tool_index_from_delta,
+                            )
                         )
                     else:
                         logger.warning(
-                            f"Textual tool call '{tool_name_from_content}' found in stream, but not in available tools."
+                            f"_astream (async): Received tool_call delta with args for index {tool_index_from_delta} but no active tool stream started. Delta: {tc_obj}. Yielding with available info."
+                        )
+                        parsed_tool_call_chunks_for_current_raw_chunk.append(
+                            ToolCallChunk(
+                                name=tool_name_from_delta,
+                                args=tool_args_str_from_delta,
+                                id=tool_call_id_from_delta,
+                                index=tool_index_from_delta,
+                            )
+                        )
+                # Fallback or alternative: parse from completion_message if no tool calls from event_delta
+                elif (
+                    hasattr(raw_api_chunk, "completion_message")
+                    and raw_api_chunk.completion_message
+                    and hasattr(raw_api_chunk.completion_message, "tool_calls")
+                    and raw_api_chunk.completion_message.tool_calls
+                ):
+                    logger.debug(
+                        "_astream: Attempting to parse tool_calls from completion_message."
+                    )
+                    api_tool_calls = raw_api_chunk.completion_message.tool_calls
+                    for idx, tc in enumerate(api_tool_calls):
+                        func = getattr(tc, "function", None)
+                        if func:
+                            tool_name = getattr(func, "name", None)
+                            tool_args_str = getattr(func, "arguments", "")
+                            tool_id = getattr(tc, "id", None)
+                            tool_index = getattr(
+                                tc, "index", idx
+                            )  # Use 'idx' as fallback for index
+                            if tool_name and tool_id:
+                                parsed_tool_call_chunks_for_current_raw_chunk.append(
+                                    ToolCallChunk(
+                                        name=tool_name,
+                                        args=tool_args_str,
+                                        id=tool_id,
+                                        index=tool_index,
+                                    )
+                                )
+                                logger.debug(
+                                    f"_astream: Parsed ToolCallChunk from completion_message: id={tool_id}, name={tool_name}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"_astream: Skipping tool call from completion_message due to missing name or id: {tc}"
+                                )
+                        else:
+                            logger.warning(
+                                f"_astream: Tool call structure in completion_message missing 'function' field: {tc}"
+                            )
+
+                # Warning if stop_reason indicates tool_calls, but none were parsed
+                if (
+                    not parsed_tool_call_chunks_for_current_raw_chunk
+                    and final_stop_reason == "tool_calls"
+                ):
+                    logger.warning(
+                        f"_astream: Expected tool call due to stop_reason='tool_calls' but did not parse any. Chunk: {raw_api_chunk_dict}"
+                    )
+
+                if event_type == "metrics" and isinstance(event_metrics_list, list):
+                    logger.debug(
+                        f"_astream (async): Entered METRICS event block. event_metrics_list: {event_metrics_list}"
+                    )
+                    parsed_prompt_tokens = 0
+                    parsed_completion_tokens = 0
+                    parsed_total_tokens = 0
+                    for metric_item in event_metrics_list:
+                        metric_name = None
+                        metric_value_any = None
+                        if hasattr(metric_item, "metric") and hasattr(
+                            metric_item, "value"
+                        ):
+                            metric_name = metric_item.metric
+                            metric_value_any = metric_item.value
+                        elif isinstance(metric_item, dict):
+                            metric_name = metric_item.get("metric")
+                            metric_value_any = metric_item.get("value")
+                        if metric_name and metric_value_any is not None:
+                            metric_value = int(float(metric_value_any))
+                            if metric_name == "num_prompt_tokens":
+                                parsed_prompt_tokens = metric_value
+                            elif metric_name == "num_completion_tokens":
+                                parsed_completion_tokens = metric_value
+                            elif metric_name == "num_total_tokens":
+                                parsed_total_tokens = metric_value
+                    cumulative_usage_for_gen_info["input_tokens"] = parsed_prompt_tokens
+                    cumulative_usage_for_gen_info["output_tokens"] = (
+                        parsed_completion_tokens
+                    )
+                    cumulative_usage_for_gen_info["total_tokens"] = parsed_total_tokens
+                    logger.debug(
+                        f"_astream (async): METRICS event - Parsed tokens: p={parsed_prompt_tokens}, c={parsed_completion_tokens}, t={parsed_total_tokens}"
+                    )
+                    if (
+                        parsed_prompt_tokens > 0
+                        or parsed_completion_tokens > 0
+                        or parsed_total_tokens > 0
+                    ):
+                        usage_metadata_for_metrics_chunk = UsageMetadata(
+                            input_tokens=parsed_prompt_tokens,
+                            output_tokens=parsed_completion_tokens,
+                            total_tokens=parsed_total_tokens,
+                        )
+                        logger.debug(
+                            f"_astream (async): METRICS EVENT - Created usage_metadata_for_metrics_chunk: {usage_metadata_for_metrics_chunk}"
+                        )
+                        response_metadata_for_metrics_event = current_gen_info.copy()
+                        response_metadata_for_metrics_event.pop("usage_metadata", None)
+                        metrics_ai_chunk = AIMessageChunk(
+                            content="",
+                            usage_metadata=usage_metadata_for_metrics_chunk,
+                            response_metadata=response_metadata_for_metrics_event,
+                            id=raw_api_chunk_dict.get("id"),
+                        )
+                        logger.debug(
+                            f"_astream (async): METRICS EVENT - Yielding metrics_ai_chunk: {metrics_ai_chunk.to_json()} with gen_info: {current_gen_info}"
+                        )
+                        gen_info_for_metrics_generation_chunk = current_gen_info.copy()
+                        gen_info_for_metrics_generation_chunk["usage_metadata"] = (
+                            UsageMetadata(
+                                input_tokens=cumulative_usage_for_gen_info.get(
+                                    "input_tokens", 0
+                                ),
+                                output_tokens=cumulative_usage_for_gen_info.get(
+                                    "output_tokens", 0
+                                ),
+                                total_tokens=cumulative_usage_for_gen_info.get(
+                                    "total_tokens", 0
+                                ),
+                            )
+                        )
+                        yield ChatGenerationChunk(
+                            message=metrics_ai_chunk,
+                            generation_info=gen_info_for_metrics_generation_chunk,
+                        )
+                        yielded_any_chunk = True  # Ensure this is set
+                    else:
+                        logger.debug(
+                            "_astream (async): METRICS EVENT - No valid token counts parsed, not yielding metrics_ai_chunk."
+                        )
+                else:  # Handles "start", "progress" (text part), "complete"
+                    content_str = ""
+                    # Extract text content only if event_delta is text and not a tool_call type
+                    if (
+                        event_delta
+                        and hasattr(event_delta, "text")
+                        and isinstance(event_delta.text, str)
+                        and getattr(event_delta, "type", None)
+                        != "tool_call"  # Ensure not a tool_call delta
+                    ):
+                        content_str = event_delta.text
+                    if (
+                        not content_str and raw_api_chunk_dict
+                    ):  # Fallback text extraction
+                        try:
+                            if "completion_message" in raw_api_chunk_dict:
+                                comp_msg = raw_api_chunk_dict["completion_message"]
+                                if isinstance(comp_msg, dict) and "content" in comp_msg:
+                                    content = comp_msg["content"]
+                                    if isinstance(content, dict) and "text" in content:
+                                        content_str = content["text"]
+                                    elif isinstance(content, str):
+                                        content_str = content
+                            if (
+                                not content_str
+                                and "response_metadata" in raw_api_chunk_dict
+                            ):
+                                response_meta = raw_api_chunk_dict["response_metadata"]
+                                if (
+                                    isinstance(response_meta, dict)
+                                    and "completion_message" in response_meta
+                                ):
+                                    comp_msg = response_meta["completion_message"]
+                                    if (
+                                        isinstance(comp_msg, dict)
+                                        and "content" in comp_msg
+                                    ):
+                                        content = comp_msg["content"]
+                                        if (
+                                            isinstance(content, dict)
+                                            and "text" in content
+                                        ):
+                                            content_str = content["text"]
+                                        elif isinstance(content, str):
+                                            content_str = content
+                        except (KeyError, TypeError):
+                            pass
+                    response_metadata_for_content_chunk = {
+                        "model_name": self.model_name
+                    }
+                    if final_stop_reason:
+                        response_metadata_for_content_chunk["finish_reason"] = (
+                            final_stop_reason
+                        )
+                    if raw_api_chunk_dict.get("x_request_id"):
+                        response_metadata_for_content_chunk["x_request_id"] = (
+                            raw_api_chunk_dict.get("x_request_id")
+                        )
+                    if (
+                        event_type == "start"
+                        or content_str
+                        or parsed_tool_call_chunks_for_current_raw_chunk
+                        or final_stop_reason  # Yield if there's a stop reason, even if no other content
+                    ):
+                        lc_chunk_message = AIMessageChunk(
+                            content=content_str or "",
+                            tool_call_chunks=parsed_tool_call_chunks_for_current_raw_chunk,
+                            response_metadata=response_metadata_for_content_chunk,
+                            id=raw_api_chunk_dict.get("id"),
+                        )
+                        final_gen_info_for_chunk = current_gen_info.copy()
+                        if (
+                            cumulative_usage_for_gen_info.get("input_tokens")
+                            or cumulative_usage_for_gen_info.get("output_tokens")
+                            or cumulative_usage_for_gen_info.get("total_tokens")
+                        ):
+                            final_gen_info_for_chunk["usage_metadata"] = UsageMetadata(
+                                input_tokens=cumulative_usage_for_gen_info.get(
+                                    "input_tokens", 0
+                                ),
+                                output_tokens=cumulative_usage_for_gen_info.get(
+                                    "output_tokens", 0
+                                ),
+                                total_tokens=cumulative_usage_for_gen_info.get(
+                                    "total_tokens", 0
+                                ),
+                            )
+                        lc_chunk = ChatGenerationChunk(
+                            message=lc_chunk_message,
+                            generation_info=final_gen_info_for_chunk,
+                        )
+                        if run_manager and hasattr(run_manager, "on_llm_new_token"):
+                            token_text = (
+                                lc_chunk.text if isinstance(lc_chunk.text, str) else ""
+                            )
+                            await run_manager.on_llm_new_token(
+                                token_text, chunk=lc_chunk
+                            )
+                        yield lc_chunk
+                        yielded_any_chunk = True
+        except Exception as e:
+            logger.error(f"Error during Llama API async stream: {e}", exc_info=True)
+            stream_failed = True  # Mark that the stream attempt failed
+            if run_manager and hasattr(run_manager, "on_llm_error"):
+                # Pass a generic response or None if not available
+                await run_manager.on_llm_error(error=e, response=None)  # type: ignore[call-arg]
+
+        if not yielded_any_chunk:
+            logger.debug(
+                "No chunks were yielded during async streaming, providing a fallback empty chunk"
+            )
+            # Create an empty message chunk containing the structured output format
+            empty_ai_message_chunk = AIMessageChunk(
+                content="",
+                tool_call_chunks=[],
+                response_metadata={
+                    "model_name": self.model_name,
+                    "finish_reason": "tool_calls",
+                },
+            )
+
+            # Include the full generation info
+            final_gen_info = {
+                "model_name": self.model_name,
+                "finish_reason": "tool_calls",
+            }
+
+            # Create a tool call chunk for structured output
+            effective_tools_lc_input = kwargs.get("tools")
+            prepared_llm_tools = None
+
+            if (
+                effective_tools_lc_input
+                and isinstance(effective_tools_lc_input, list)
+                and effective_tools_lc_input
+            ):
+                try:
+                    tool_name = None
+                    first_tool = effective_tools_lc_input[0]
+                    logger.debug(
+                        f"Fallback chunk (async): attempting to get tool_name from first_tool: {first_tool} (type: {type(first_tool)})"
+                    )
+
+                    try:
+                        tool_schema_for_conversion = first_tool
+                        converted_tool = convert_to_openai_tool(
+                            tool_schema_for_conversion
+                        )
+                        tool_name = converted_tool["function"]["name"]
+                        logger.debug(
+                            f"Fallback chunk (async): tool_name extracted via convert_to_openai_tool as: {tool_name}"
+                        )
+                    except Exception as conversion_err:
+                        logger.warning(
+                            f"Fallback chunk (async): Failed to convert first_tool to OpenAI format for name extraction: {conversion_err}",
+                            exc_info=True,
+                        )
+                        logger.warning(
+                            "Fallback chunk (async): Attempting fragile tool_name extraction..."
+                        )
+                        if isinstance(first_tool, dict):
+                            if "name" in first_tool:
+                                tool_name = first_tool["name"]
+                            elif (
+                                "function" in first_tool
+                                and isinstance(first_tool["function"], dict)
+                                and "name" in first_tool["function"]
+                            ):
+                                tool_name = first_tool["function"]["name"]
+                        else:  # If not a dict, assume it might be a Pydantic model or other class
+                            try:
+                                if hasattr(first_tool, "name") and not callable(
+                                    getattr(first_tool, "name")
+                                ):
+                                    tool_name = getattr(first_tool, "name")
+                                elif hasattr(first_tool, "name") and callable(
+                                    getattr(first_tool, "name")
+                                ):
+                                    tool_name = getattr(
+                                        first_tool, "name"
+                                    )()  # For BaseTool-like objects
+                                elif hasattr(
+                                    first_tool, "__name__"
+                                ):  # For classes (like Pydantic models)
+                                    tool_name = getattr(first_tool, "__name__")
+                            except Exception as attr_err:
+                                logger.warning(
+                                    f"Fallback chunk (async): Fragile tool_name extraction via attributes failed: {attr_err}"
+                                )
+                                pass
+                        if not tool_name:
+                            try:
+                                tool_name = str(first_tool).split()[0]
+                            except Exception as str_err:
+                                logger.warning(
+                                    f"Fallback chunk (async): Fragile tool_name extraction via str() failed: {str_err}"
+                                )
+                        logger.debug(
+                            f"Fallback chunk (async): tool_name from fragile extraction: {tool_name}"
                         )
 
-            chunk = ChatGenerationChunk(
-                message=AIMessageChunk(
-                    content=content_str,
-                    tool_call_chunks=chunk_tool_calls_for_aimc_obj,
-                ),
-                generation_info=generation_info if generation_info else None,
+                    if tool_name:
+                        tool_id = str(uuid.uuid4())
+                        parsed_tool_call_chunks = [
+                            ToolCallChunk(
+                                name=tool_name,
+                                args="{}",  # Use empty JSON object for args
+                                id=tool_id,
+                                index=0,
+                            )
+                        ]
+                        empty_ai_message_chunk.tool_call_chunks = (
+                            parsed_tool_call_chunks
+                        )
+                    else:
+                        logger.warning(
+                            f"Could not determine tool_name for fallback chunk, tool_call_chunks will be empty."
+                        )
+
+                except Exception as e:
+                    logger.warning(f"Failed to create fallback tool call chunk: {e}")
+
+            # Yield the fallback chunk
+            yield ChatGenerationChunk(
+                message=empty_ai_message_chunk, generation_info=final_gen_info
             )
-            if run_manager and hasattr(run_manager, "on_llm_new_token"):
-                await run_manager.on_llm_new_token(chunk.text, chunk=chunk)
-            yield chunk
 
     async def _astream_with_aggregation_and_retries(
         self,
@@ -712,7 +1059,18 @@ class AsyncChatMetaLlamaMixin:
             # These are already in LangChain's ToolCallChunk format
             # AIMessageChunk wants a list of these chunk dicts
             tool_call_chunks_for_aimessagechunk = []
-            if chunk.message and chunk.message.tool_call_chunks:
+            if (
+                hasattr(
+                    chunk, "message"
+                )  # First check if chunk has a message attribute
+                and isinstance(
+                    chunk.message, AIMessageChunk
+                )  # Then check if it's an AIMessageChunk
+                and hasattr(
+                    chunk.message, "tool_call_chunks"
+                )  # Then check if it has tool_call_chunks
+                and chunk.message.tool_call_chunks  # And if that list is not empty
+            ):
                 tool_call_chunks_for_aimessagechunk = chunk.message.tool_call_chunks
 
             # Yield a new chunk that correctly represents the state *after* this incoming chunk
@@ -742,7 +1100,7 @@ class AsyncChatMetaLlamaMixin:
         # We'll collect all ToolCallChunk data and then reconstruct full ToolCall dicts.
 
         # Store tool call parts by index, then by id.
-        # Each entry in aggregated_tool_calls_parts will be a dict like:
+        # Each entry in aggregated_tool_call_parts will be a dict like:
         # { 'id': str, 'name': Optional[str], 'args_str_parts': List[str], 'type': str }
         aggregated_tool_call_parts_by_index: Dict[int, Dict[str, Any]] = {}
 
@@ -767,23 +1125,29 @@ class AsyncChatMetaLlamaMixin:
             elif chunk.generation_info:  # last resort for some dict
                 raw_response_dict_for_llm_output = chunk.generation_info
 
-            if chunk.message and chunk.message.tool_call_chunks:
+            if (
+                hasattr(
+                    chunk, "message"
+                )  # First check if chunk has a message attribute
+                and isinstance(
+                    chunk.message, AIMessageChunk
+                )  # Then check if it's an AIMessageChunk
+                and hasattr(
+                    chunk.message, "tool_call_chunks"
+                )  # Then check if it has tool_call_chunks
+                and chunk.message.tool_call_chunks  # And if that list is not empty
+            ):
                 for tc_chunk in chunk.message.tool_call_chunks:
-                    # tc_chunk is a dict: {'id': str, 'name': Optional[str], 'args': str (delta), 'index': int, 'type': Optional[str]}
                     idx = tc_chunk.get("index")
                     tc_id = tc_chunk.get("id")
-
-                    if idx is not None:  # Streaming tool calls should have an index
+                    if idx is not None:
                         if idx not in aggregated_tool_call_parts_by_index:
                             aggregated_tool_call_parts_by_index[idx] = {
                                 "id": tc_id,
                                 "name": tc_chunk.get("name"),
                                 "args_str_parts": [],
-                                "type": tc_chunk.get(
-                                    "type", "function"
-                                ),  # Default to function
+                                "type": tc_chunk.get("type", "function"),
                             }
-                        # Update name if it wasn't set before (usually comes in first part)
                         if tc_chunk.get(
                             "name"
                         ) and not aggregated_tool_call_parts_by_index[idx].get("name"):
@@ -792,9 +1156,8 @@ class AsyncChatMetaLlamaMixin:
                             )
                         if tc_id and not aggregated_tool_call_parts_by_index[idx].get(
                             "id"
-                        ):  # Update ID if not set
+                        ):
                             aggregated_tool_call_parts_by_index[idx]["id"] = tc_id
-
                         args_delta = tc_chunk.get("args")
                         if isinstance(args_delta, str):
                             aggregated_tool_call_parts_by_index[idx][
