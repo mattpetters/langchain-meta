@@ -2,7 +2,7 @@
 
 ## **DEPRECATION NOTICE:** 
 - We are in the process of migrating this repo over to the official Langchain repository at [langchain-ai/langchain-meta](https://github.com/langchain-ai/langchain-meta)
-- Once that process is completed this repo will be no longer maintained and subsequently deleted.
+- Once that process is completed, this repo will no longer be maintained and subsequently deleted.
 
 Native integration between the [Meta Llama API](https://www.llama.com/products/llama-api/) 🦙 and the [LangChain/LangGraph ecosystem](https://www.langchain.com/), ⛓ providing fast hosted access to Meta's powerful Llama 4 models to power your Langgraph agents.
 Fully implements [ChatModel interface](https://python.langchain.com/docs/concepts/chat_models/).
