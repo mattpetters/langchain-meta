@@ -15,7 +15,7 @@ Set up your credentials with environment variables:
 export META_API_KEY="your-api-key"
 export META_API_BASE_URL="https://api.llama.com/v1"
 export META_MODEL_NAME="Llama-4-Maverick-17B-128E-Instruct-FP8"
-# Optional, see list: https://llama.developer.meta.com/docs/api/models/
+# Optional, see list: https://llama.developer.meta.com/docs/models
 ```
 
 ## Usage
