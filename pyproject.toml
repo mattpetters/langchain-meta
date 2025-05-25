@@ -21,7 +21,7 @@ disallow_untyped_defs = true
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 pydantic = ">=1.10,<3.0"
-llama-api-client = ">=0.1.0"
+llama-api-client = ">=0.1.1"
 langchain-core = ">=0.1.33"
 twine = ">=6.0.0"
 typing-extensions = ">=4.8.0"
